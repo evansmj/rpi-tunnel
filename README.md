@@ -16,6 +16,7 @@ the internet.
 
 Setup:
 Set up a tailscale exit node at home on a spare computer or raspberrypi.
+If you are using umbrel, see my `umbrel-docker-compose.yml` file for help in setting it as an exit node.
 On your travel router: 
   Flash raspberrypi bookworm os and set it up with a wifi that your computer is also on 
   (for initial setup to be able to run ssh.  Alternatively connect your computer to your
