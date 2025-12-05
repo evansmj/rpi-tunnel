@@ -17,7 +17,8 @@ the internet.
 Setup:
 Set up a tailscale exit node at home on a spare computer or raspberrypi.
 If you are using umbrel, see my `umbrel-docker-compose.yml` file for help in setting it as an exit node.
-On your travel router: 
+On your travel router:
+  Make sure you have 2 wifi adapters/antennas.  I've used an Asus USB-N53 and a NetGear usb wifi with success.  The internal raspberrypi5 wifi antenna connects to the hotel wifi, and the usb wifi adapter provides wifi access for your devices to connect to. 
   Flash raspberrypi bookworm os and set it up with a wifi that your computer is also on 
   (for initial setup to be able to run ssh.  Alternatively connect your computer to your
   raspberrypi with an ethernet cable to be able to ssh into the raspberrypi.)
