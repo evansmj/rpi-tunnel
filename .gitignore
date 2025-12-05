@@ -1,0 +1,49 @@
+# Tunnel Project .gitignore
+
+# Personal configuration files (contain sensitive data)
+tunnel.conf
+
+# Backup files
+*.backup
+*.bak
+*~
+
+# Log files
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+.tmp
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Runtime files
+*.pid
+*.sock
+
+# SSH keys and certificates
+*.key
+*.pem
+*.crt
+*.p12
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Any file with "secret" or "private" in the name
+*secret*
+*private*
+*credentials*

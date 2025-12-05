@@ -1,0 +1,72 @@
+# Tunnel Configuration Example
+# Copy this file to tunnel.conf and customize with your values
+
+# =============================================================================
+# TAILSCALE CONFIGURATION
+# =============================================================================
+
+# Your Tailscale exit node IP address
+# Find this with: tailscale status
+TAILSCALE_EXIT_NODE_IP="100.x.x.x"
+
+# Your Tailscale exit node device name
+# Find this with: tailscale status
+TAILSCALE_EXIT_NODE_NAME="your-exit-node-name"
+
+# The public IP address of your exit node
+# Find this by connecting to your exit node and visiting: curl ifconfig.me
+TAILSCALE_EXPECTED_IP="x.x.x.x"
+
+# Tailscale DNS server (usually this default is fine)
+TAILSCALE_DNS="100.100.100.100"
+
+# =============================================================================
+# WIFI ACCESS POINT CONFIGURATION
+# =============================================================================
+
+# The name (SSID) of your WiFi access point
+AP_SSID="MyTunnel"
+
+# Password for your WiFi access point (minimum 8 characters for WPA2)
+AP_PASSWORD="SecurePassword123"
+
+# WiFi channel 
+# 2.4GHz: 1-11 (6 is usually a good default)
+# 5GHz: 36,40,44,48 (indoor), 149,153,157,161,165 (outdoor/less restricted)
+AP_CHANNEL="6"
+
+# =============================================================================
+# NETWORK CONFIGURATION
+# =============================================================================
+
+# IP address range for your access point (change if conflicts with hotel WiFi)
+# Format: first three octets (e.g., "10.0.50" creates 10.0.50.x network)
+AP_IP_RANGE="10.0.50"
+
+# Gateway IP (usually .1 of your range)
+AP_GATEWAY="10.0.50.1"
+
+# DHCP range for client devices
+DHCP_START="10.0.50.10"
+DHCP_END="10.0.50.100"
+
+# DHCP lease time
+DHCP_LEASE_TIME="12h"
+
+# =============================================================================
+# DNS CONFIGURATION
+# =============================================================================
+
+# Fallback DNS servers (used during setup)
+FALLBACK_DNS_PRIMARY="8.8.8.8"
+FALLBACK_DNS_SECONDARY="1.1.1.1"
+
+# =============================================================================
+# ADVANCED CONFIGURATION
+# =============================================================================
+
+# Enable debug output (true/false)
+DEBUG_MODE="false"
+
+# Automatically start services after configuration (true/false)
+AUTO_START_SERVICES="true"
