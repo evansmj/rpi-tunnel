@@ -35,6 +35,16 @@ AP_PASSWORD="SecurePassword123"
 # 5GHz: 36,40,44,48 (indoor), 149,153,157,161,165 (outdoor/less restricted)
 AP_CHANNEL="6"
 
+# WiFi hardware mode (frequency band)
+# Options: 
+#   g (2.4GHz 802.11g - most compatible)
+#   a (5GHz 802.11a - for WiFi 6 adapters like Netgear A8000)
+#   n (2.4GHz 802.11n)
+#   ac (5GHz 802.11ac)
+# Note: Your USB WiFi adapter must support the selected mode
+# For WiFi 6 (802.11ax) adapters, use "a" mode with 5GHz channels
+AP_HW_MODE="g"
+
 # =============================================================================
 # NETWORK CONFIGURATION
 # =============================================================================

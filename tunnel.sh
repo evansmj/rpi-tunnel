@@ -146,7 +146,19 @@ sudo apt install -y hostapd dnsmasq nftables curl wireless-tools
 # Restore normal DNS management after package updates
 echo "=== Restoring DNS management ==="
 sudo chattr -i /etc/resolv.conf 2>/dev/null || true
-sudo systemctl start systemd-resolved 2>/dev/null || true
+
+# Configure systemd-resolved to work with Tailscale (or disable it)
+# Tailscale needs to manage DNS for exit nodes to work properly
+echo "Configuring DNS for Tailscale compatibility..."
+# Stop systemd-resolved to prevent DNS conflicts with Tailscale
+sudo systemctl stop systemd-resolved 2>/dev/null || true
+sudo systemctl disable systemd-resolved 2>/dev/null || true
+
+# Create a simple resolv.conf that Tailscale can manage
+sudo rm -f /etc/resolv.conf
+echo "nameserver 127.0.0.1" | sudo tee /etc/resolv.conf > /dev/null
+echo "nameserver ::1" | sudo tee -a /etc/resolv.conf > /dev/null
+# Don't make it immutable - let Tailscale manage it
 
 echo "=== Installing Tailscale (from official repo) ==="
 curl -fsSL https://tailscale.com/install.sh | sh
@@ -223,7 +235,7 @@ sudo tee /etc/hostapd/hostapd.conf > /dev/null <<EOF
 interface=$USB_WIFI
 driver=nl80211
 ssid=$AP_SSID
-hw_mode=g
+hw_mode=${AP_HW_MODE:-g}
 channel=${AP_CHANNEL:-6}
 wmm_enabled=1
 macaddr_acl=0
@@ -233,6 +245,10 @@ wpa=2
 wpa_passphrase=$AP_PASSWORD
 wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
+$(if [ "${AP_HW_MODE:-g}" = "a" ] || [ "${AP_HW_MODE:-g}" = "ac" ]; then
+  echo "ieee80211ac=1"
+  echo "ieee80211ax=1"
+fi)
 EOF
 
 sudo sed -i 's|#DAEMON_CONF="".*|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/default/hostapd
@@ -362,7 +378,8 @@ Type=oneshot
 ExecStart=/usr/bin/tailscale up \\
     --exit-node=$TAILSCALE_EXIT_NODE_IP \\
     --exit-node-allow-lan-access=false \\
-    --accept-routes
+    --accept-routes \\
+    --accept-dns
 RemainAfterExit=yes
 
 [Install]
@@ -418,15 +435,16 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'ip link set $USB_WIFI down; iw dev $USB_WIFI set type __ap; ip link set $USB_WIFI up; ip addr add ${AP_GATEWAY}/24 dev $USB_WIFI'
+ExecStart=/bin/bash -c 'ip link set $USB_WIFI down 2>/dev/null || true; iw dev $USB_WIFI set type __ap 2>/dev/null || true; ip link set $USB_WIFI up 2>/dev/null || true; ip addr flush dev $USB_WIFI 2>/dev/null || true; ip addr add ${AP_GATEWAY}/24 dev $USB_WIFI 2>/dev/null || true'
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Replace the USB_WIFI variable in the service file
+# Replace the USB_WIFI and AP_GATEWAY variables in the service file
 sudo sed -i "s/\$USB_WIFI/$USB_WIFI/g" /etc/systemd/system/usb-wifi-ap.service
+sudo sed -i "s/\${AP_GATEWAY}/$AP_GATEWAY/g" /etc/systemd/system/usb-wifi-ap.service
 
 sudo systemctl daemon-reload
 sudo systemctl enable usb-wifi-ap
@@ -456,11 +474,11 @@ if sudo tailscale status | grep -q "logged out\|not logged in"; then
     echo "⚠️  Tailscale needs authentication. Run these commands manually:"
     echo "   sudo tailscale up"
     echo "   (Follow the URL to authenticate)"
-    echo "   sudo tailscale up --exit-node=$TAILSCALE_EXIT_NODE_IP --exit-node-allow-lan-access=false --accept-routes"
+    echo "   sudo tailscale up --exit-node=$TAILSCALE_EXIT_NODE_IP --exit-node-allow-lan-access=false --accept-routes --accept-dns"
     echo "   sudo ip route add default dev tailscale0 metric 0"
 else
     echo "Tailscale is authenticated. Configuring exit node and routing..."
-    sudo tailscale up --exit-node=$TAILSCALE_EXIT_NODE_IP --exit-node-allow-lan-access=false --accept-routes
+    sudo tailscale up --exit-node=$TAILSCALE_EXIT_NODE_IP --exit-node-allow-lan-access=false --accept-routes --accept-dns
     sleep 3
     
     # Remove any existing incomplete Tailscale routes
@@ -472,8 +490,34 @@ else
     sudo ip rule add from ${AP_IP_RANGE}.0/24 to ${AP_IP_RANGE}.0/24 table main priority 100 2>/dev/null || echo "Local routing rule already exists"
     sudo ip rule add to ${AP_IP_RANGE}.0/24 table main priority 50 2>/dev/null || echo "Return traffic routing rule already exists"
     
+    # Fix Tailscale hijacking local home network traffic
+    # Get local network from wlan0 (home WiFi)
+    if ip addr show $ONBOARD_WIFI 2>/dev/null | grep -q "inet "; then
+        LOCAL_NET=$(ip route show dev $ONBOARD_WIFI | grep -E "^[0-9]" | head -1 | awk '{print $1}')
+        if [ -n "$LOCAL_NET" ] && [ "$LOCAL_NET" != "${AP_IP_RANGE}.0/24" ]; then
+            echo "Excluding local network $LOCAL_NET from Tailscale routing..."
+            sudo ip rule add from $LOCAL_NET to $LOCAL_NET table main priority 90 2>/dev/null || echo "Local network routing rule already exists"
+            sudo ip rule add to $LOCAL_NET table main priority 40 2>/dev/null || echo "Local network return routing rule already exists"
+        fi
+    fi
+    
     # Let Tailscale handle its own routing when using exit nodes
     echo "✅ Letting Tailscale manage exit node routing automatically"
+    
+    # Verify DNS is properly configured
+    echo "Verifying DNS configuration..."
+    sleep 2
+    if lsattr /etc/resolv.conf 2>/dev/null | grep -q "i"; then
+        echo "⚠️  Warning: /etc/resolv.conf is still immutable - removing flag..."
+        sudo chattr -i /etc/resolv.conf 2>/dev/null || true
+    fi
+    
+    # Check if Tailscale is managing DNS
+    if grep -q "100.100.100.100" /etc/resolv.conf 2>/dev/null; then
+        echo "✅ Tailscale DNS is active"
+    else
+        echo "⚠️  Tailscale DNS not detected in resolv.conf - may need manual configuration"
+    fi
     
     echo "✅ Tailscale routing configured"
 fi
@@ -624,7 +668,7 @@ fi
 echo ""
 echo "📋 Manual Commands (if needed):"
 echo "  - Authenticate Tailscale: sudo tailscale up"
-echo "  - Configure exit node: sudo tailscale up --exit-node=$TAILSCALE_EXIT_NODE_IP --exit-node-allow-lan-access=false --accept-routes"
+echo "  - Configure exit node: sudo tailscale up --exit-node=$TAILSCALE_EXIT_NODE_IP --exit-node-allow-lan-access=false --accept-routes --accept-dns"
 echo "  - Fix routing: sudo ip route del 0.0.0.0/1 dev tailscale0; sudo ip route del 128.0.0.0/1 dev tailscale0"
 echo "  - Restart services: sudo systemctl restart hostapd dnsmasq"
 echo ""
