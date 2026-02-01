@@ -1176,17 +1176,31 @@ fi
 
 if [[ "$UPDATE_PACKAGES" =~ ^[Yy]$ ]]; then
     echo "=== Updating system ==="
-    sudo apt update && sudo apt upgrade -y
+    if sudo apt update; then
+        sudo apt upgrade -y || echo "⚠️  Package upgrade failed, but continuing..."
+    else
+        echo "⚠️  Package list update failed (may be due to system clock issues), but continuing..."
+        echo "   💡 If packages fail to install, check your system clock: date"
+    fi
 else
     echo "=== Skipping system updates ==="
     # Still need to update package list for installs
-    sudo apt update
+    if ! sudo apt update; then
+        echo "⚠️  Package list update failed (may be due to system clock issues), but continuing..."
+        echo "   💡 If packages fail to install, check your system clock: date"
+    fi
 fi
 
 # Install missing dependencies
 if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
     echo "=== Installing missing dependencies: ${MISSING_DEPS[*]} ==="
-    sudo apt install -y "${MISSING_DEPS[@]}"
+    if sudo apt install -y "${MISSING_DEPS[@]}"; then
+        echo "✅ Dependencies installed successfully"
+    else
+        echo "⚠️  Failed to install some dependencies, but continuing..."
+        echo "   💡 You may need to install them manually later"
+        echo "   💡 If this is due to package list errors, check your system clock: date"
+    fi
 else
     echo "=== All dependencies already installed, skipping installation ==="
 fi
@@ -1209,7 +1223,12 @@ echo "nameserver ::1" | sudo tee -a /etc/resolv.conf > /dev/null
 # Don't make it immutable - let Tailscale manage it
 
 echo "=== Installing Tailscale (from official repo) ==="
-curl -fsSL https://tailscale.com/install.sh | sh
+if curl -fsSL https://tailscale.com/install.sh | sh; then
+    echo "✅ Tailscale installation completed"
+else
+    echo "⚠️  Tailscale installation failed, but continuing..."
+    echo "   💡 Tailscale may already be installed, or you may need to install it manually"
+fi
 
 echo "=== Stop services while we configure ==="
 sudo systemctl stop hostapd || true
