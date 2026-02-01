@@ -1330,6 +1330,25 @@ enable_nmtui() {
 # --- Wi-Fi Access Point (using USB Wi-Fi) ---
 echo "=== Configuring Wi-Fi access point on $USB_WIFI ==="
 
+# =============================================================================
+# SET REGULATORY DOMAIN FOR 5GHz CHANNELS
+# =============================================================================
+echo "=== Setting regulatory domain for 5GHz channels ==="
+# Set regulatory domain to enable proper 5GHz channels (especially UNII-3: 149-165)
+# This ensures 5GHz channels work properly regardless of system default
+REG_COUNTRY="${REGULATORY_COUNTRY:-US}"
+if sudo iw reg set "$REG_COUNTRY" 2>/dev/null; then
+    CURRENT_REG=$(iw reg get 2>/dev/null | grep "country" | head -1 | awk '{print $2}' || echo "unknown")
+    echo "   ✅ Regulatory domain set to: $CURRENT_REG"
+    if [ "$CURRENT_REG" != "$REG_COUNTRY" ]; then
+        echo "   ⚠️  Warning: Requested $REG_COUNTRY but got $CURRENT_REG (may need root or different method)"
+    fi
+else
+    echo "   ⚠️  Could not set regulatory domain (may require different permissions)"
+    echo "   💡 You can manually set it with: sudo iw reg set $REG_COUNTRY"
+fi
+echo ""
+
 # Properly configure the USB Wi-Fi interface for AP mode
 echo "Setting up $USB_WIFI for Access Point mode..."
 sudo systemctl stop hostapd || true
@@ -1600,11 +1619,19 @@ else
     fi
 fi
 
+# Determine correct hw_mode value for hostapd
+# hostapd uses: g (2.4GHz), a (5GHz), n (2.4GHz), but NOT "ac" directly
+# For "ac" mode, we use hw_mode=a and enable 802.11ac features
+HOSTAPD_HW_MODE="${AP_HW_MODE:-g}"
+if [ "$HOSTAPD_HW_MODE" = "ac" ]; then
+    HOSTAPD_HW_MODE="a"  # hostapd uses "a" for 5GHz, then we enable ac features
+fi
+
 sudo tee /etc/hostapd/hostapd.conf > /dev/null <<EOF
 interface=$USB_WIFI
 driver=nl80211
 ssid=$AP_SSID
-hw_mode=${AP_HW_MODE:-g}
+hw_mode=$HOSTAPD_HW_MODE
 channel=${AP_CHANNEL:-6}
 wmm_enabled=1
 macaddr_acl=0

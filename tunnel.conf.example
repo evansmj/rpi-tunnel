@@ -45,6 +45,13 @@ AP_CHANNEL="6"
 # For WiFi 6 (802.11ax) adapters, use "a" mode with 5GHz channels
 AP_HW_MODE="g"
 
+# Regulatory country code for WiFi channels
+# Set this to your country code (e.g., US, GB, CA, AU) to enable proper 5GHz channels
+# US enables UNII-3 channels (149-165) which don't interfere with UNII-1 (36-48)
+# Common codes: US (United States), GB (Great Britain), CA (Canada), AU (Australia)
+# If using 5GHz UNII-3 channels (149-165), set to US for best compatibility
+REGULATORY_COUNTRY="US"
+
 # =============================================================================
 # NETWORK CONFIGURATION
 # =============================================================================
