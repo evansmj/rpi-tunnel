@@ -11,6 +11,45 @@ fi
 # Track fixes applied
 FIXES_APPLIED=()
 
+# =============================================================================
+# Write a clean NetworkManager.conf from scratch (idempotent, no appending)
+# =============================================================================
+write_clean_nm_conf() {
+    local hotel_iface="${1:-wlan0}"
+    local ap_iface="${2:-wlan1}"
+    local nm_conf="/etc/NetworkManager/NetworkManager.conf"
+
+    sudo bash -c "cat > '$nm_conf'" << NMEOF
+[main]
+plugins=ifupdown,keyfile
+
+[ifupdown]
+managed=false
+
+[device]
+wifi.scan-rand-mac-address=no
+
+[device-hotel-wifi]
+match-device=interface-name:${hotel_iface}
+managed=1
+
+[device-ap-wifi]
+match-device=interface-name:${ap_iface}
+managed=0
+
+[keyfile]
+unmanaged-devices=interface-name:${ap_iface}
+NMEOF
+
+    local kf_count
+    kf_count=$(grep -c '^\[keyfile\]' "$nm_conf" 2>/dev/null || echo "0")
+    if [ "$kf_count" -ne 1 ]; then
+        echo "   ⚠️  NetworkManager.conf verification failed ($kf_count [keyfile] sections)"
+        return 1
+    fi
+    return 0
+}
+
 echo "=== Pi Tunnel Debug Script ==="
 if [ "$AUTO_FIX" = true ]; then
     echo "🔧 Auto-fix mode: ENABLED (use --no-fix to disable)"
@@ -18,6 +57,37 @@ else
     echo "🔧 Auto-fix mode: DISABLED"
 fi
 echo ""
+
+# =============================================================================
+# EARLY SANITY CHECK: Detect and fix corrupted NetworkManager.conf
+# =============================================================================
+NM_CONF="/etc/NetworkManager/NetworkManager.conf"
+if [ -f "$NM_CONF" ]; then
+    NM_CORRUPT=false
+    if grep -Pq '\x00' "$NM_CONF" 2>/dev/null; then
+        echo "⚠️  NetworkManager.conf contains null bytes (corrupted file)"
+        NM_CORRUPT=true
+    fi
+    NM_KF_COUNT=$(grep -c '^\[keyfile\]' "$NM_CONF" 2>/dev/null || echo "0")
+    if [ "$NM_KF_COUNT" -gt 1 ]; then
+        echo "⚠️  NetworkManager.conf has $NM_KF_COUNT [keyfile] sections (should be 1)"
+        NM_CORRUPT=true
+    fi
+    if [ "$NM_CORRUPT" = true ]; then
+        if [ "$AUTO_FIX" = true ]; then
+            echo "🔧 Rewriting clean NetworkManager.conf..."
+            write_clean_nm_conf "wlan0" "wlan1"
+            echo "   Restarting NetworkManager..."
+            sudo systemctl restart NetworkManager 2>/dev/null || true
+            sleep 5
+            FIXES_APPLIED+=("Rewrote corrupted NetworkManager.conf from scratch")
+            echo "✅ NetworkManager.conf fixed"
+        else
+            echo "💡 Run with auto-fix enabled, or manually rewrite NetworkManager.conf"
+        fi
+        echo ""
+    fi
+fi
 
 # Check if tunnel.sh has been run (tunnel is configured)
 TUNNEL_CONFIGURED=false
@@ -89,46 +159,18 @@ if systemctl is-active --quiet NetworkManager 2>/dev/null; then
         if [ "$AUTO_FIX" = true ]; then
             echo "   🔧 FIXING: Applying comprehensive nmtui fix..."
             
-            # Show what's currently in the config
-            if [ -f /etc/NetworkManager/NetworkManager.conf ]; then
-                echo "   🔍 BEFORE - Current config file contents:"
-                grep -A 2 -B 2 "unmanaged-devices\|keyfile" /etc/NetworkManager/NetworkManager.conf 2>/dev/null | head -10 || echo "      (no unmanaged-devices found)"
-            fi
+            # Fix 1: Rewrite clean NetworkManager.conf from scratch
+            echo "   🔧 Fix 1: Writing clean NetworkManager.conf..."
+            write_clean_nm_conf "wlan0" "wlan1"
+            echo "   ✅ NetworkManager.conf rewritten"
             
-            # Fix 1: Remove ALL unmanaged-devices lines
-            echo "   🔧 Fix 1: Removing ALL unmanaged-devices entries..."
-            sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null
-            
-            # CRITICAL: Ensure wlan1 (USB wifi) is NOT managed by NetworkManager
-            # It should be in AP mode, not managed mode
+            # Ensure wlan1 (USB wifi) is NOT managed by NetworkManager
             echo "   🔧 Fix 1b: Ensuring wlan1 (USB wifi) is NOT managed by NetworkManager..."
             sudo nmcli device set wlan1 managed no 2>/dev/null || true
-            # Make sure wlan1 is in AP mode, not managed mode
             if iw dev wlan1 info 2>/dev/null | grep -q "type AP\|type __ap"; then
                 echo "   ✅ wlan1 is correctly in AP mode"
             else
                 echo "   ⚠️  wlan1 is not in AP mode - this is expected if it's not configured yet"
-            fi
-            
-            # Fix 2: Clean up duplicate [keyfile] sections (critical fix from fix-nmtui.sh)
-            echo "   🔧 Fix 2: Cleaning up duplicate [keyfile] sections..."
-            sudo awk '/^\[keyfile\]/ { if (!seen) { seen=1; print } next } { print }' /etc/NetworkManager/NetworkManager.conf > /tmp/nm_conf_fixed 2>/dev/null
-            if [ -f /tmp/nm_conf_fixed ]; then
-                sudo mv /tmp/nm_conf_fixed /etc/NetworkManager/NetworkManager.conf
-                echo "   ✅ Cleaned up duplicate sections"
-            fi
-
-            # Fix 2b: Add wlan1 ONLY to unmanaged-devices (CRITICAL for AP mode)
-            echo "   🔧 Fix 2b: Adding wlan1 to unmanaged-devices (for AP mode)..."
-            if ! grep -q "^\[keyfile\]" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-                echo "" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-                echo "[keyfile]" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-            fi
-            if ! grep -q "unmanaged-devices=interface-name:wlan1" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-                echo "unmanaged-devices=interface-name:wlan1" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-                echo "   ✅ Added wlan1 to unmanaged-devices"
-            else
-                echo "   ✅ wlan1 already in unmanaged-devices"
             fi
             
             # Fix 3: Stop wpa_supplicant to avoid conflicts (critical fix from fix-nmtui.sh)
@@ -447,31 +489,14 @@ if systemctl is-active --quiet NetworkManager 2>/dev/null; then
             echo "   This is a full reset of NetworkManager configuration for $HOTEL_WIFI_CHECK (wlan0 - onboard)"
             echo "   CRITICAL: wlan1 (USB wifi) should NOT be managed - it's for the access point!"
             
-            # Fix 1: Completely remove ALL unmanaged-devices from config
-            echo "   Step 1: Removing all unmanaged-devices entries..."
-            sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null
+            # Fix 1: Rewrite clean NetworkManager.conf
+            echo "   Step 1: Writing clean NetworkManager.conf..."
+            write_clean_nm_conf "wlan0" "wlan1"
+            echo "   ✅ Config rewritten"
             
-            # CRITICAL: Ensure wlan1 (USB wifi) is NOT managed
+            # Ensure wlan1 (USB wifi) is NOT managed
             echo "   Step 1b: Ensuring wlan1 (USB wifi) is NOT managed by NetworkManager..."
             sudo nmcli device set wlan1 managed no 2>/dev/null || true
-            
-            # Fix 2: Clean up duplicate [keyfile] sections
-            echo "   Step 2: Cleaning up duplicate [keyfile] sections..."
-            sudo awk '/^\[keyfile\]/ { if (!seen) { seen=1; print } next } { print }' /etc/NetworkManager/NetworkManager.conf > /tmp/nm_conf_fixed 2>/dev/null
-            if [ -f /tmp/nm_conf_fixed ]; then
-                sudo mv /tmp/nm_conf_fixed /etc/NetworkManager/NetworkManager.conf
-            fi
-
-            # Fix 2b: Add wlan1 ONLY to unmanaged-devices (CRITICAL for AP mode)
-            echo "   Step 2b: Adding wlan1 to unmanaged-devices (for AP mode)..."
-            if ! grep -q "^\[keyfile\]" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-                echo "" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-                echo "[keyfile]" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-            fi
-            if ! grep -q "unmanaged-devices=interface-name:wlan1" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-                echo "unmanaged-devices=interface-name:wlan1" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-                echo "   ✅ Added wlan1 to unmanaged-devices"
-            fi
 
             # Fix 3: Aggressively stop wpa_supplicant
             echo "   Step 3: Aggressively stopping wpa_supplicant..."
@@ -524,24 +549,9 @@ if systemctl is-active --quiet NetworkManager 2>/dev/null; then
                 echo "   🔧 Trying emergency recovery - complete reset..."
                 
                 # Emergency recovery: Complete reset
-                echo "   Step 8: Emergency recovery - complete NetworkManager reset for wlan0..."
-                # Remove all unmanaged-devices
-                sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null
-                # Clean up config
-                sudo awk '/^\[keyfile\]/ { if (!seen) { seen=1; print } next } { print }' /etc/NetworkManager/NetworkManager.conf > /tmp/nm_conf_fixed 2>/dev/null
-                if [ -f /tmp/nm_conf_fixed ]; then
-                    sudo mv /tmp/nm_conf_fixed /etc/NetworkManager/NetworkManager.conf
-                fi
-                # CRITICAL: Add wlan1 ONLY to unmanaged-devices (for AP mode)
-                # This ensures wlan0 stays managed while wlan1 is free for hostapd
-                if ! grep -q "^\[keyfile\]" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-                    echo "" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-                    echo "[keyfile]" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-                fi
-                if ! grep -q "unmanaged-devices=interface-name:wlan1" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-                    echo "unmanaged-devices=interface-name:wlan1" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-                fi
-                echo "   ✅ Added wlan1 to unmanaged-devices (for AP mode)"
+                echo "   Step 8: Emergency recovery - rewriting NetworkManager.conf..."
+                write_clean_nm_conf "wlan0" "wlan1"
+                echo "   ✅ Config rewritten"
                 # Ensure wlan0 is up and managed
                 sudo ip link set wlan0 up 2>/dev/null || true
                 sudo iw dev wlan0 set type managed 2>/dev/null || true
@@ -2159,24 +2169,9 @@ if systemctl is-active --quiet NetworkManager 2>/dev/null; then
         echo "   ❌ CRITICAL: NetworkManager does NOT see wlan0!"
         echo "   💡 This is why nmtui only shows 'tun0 tailscaled' and 'wired'"
         if [ "$AUTO_FIX" = true ]; then
-            echo "   🔧 AGGRESSIVE FINAL RECOVERY: Complete reset of wlan0..."
-            # Step 1: Remove ALL unmanaged-devices from config
-            echo "      Step 1: Removing all unmanaged-devices..."
-            sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null
-            # Step 2: Clean up duplicate sections
-            sudo awk '/^\[keyfile\]/ { if (!seen) { seen=1; print } next } { print }' /etc/NetworkManager/NetworkManager.conf > /tmp/nm_conf_fixed 2>/dev/null
-            if [ -f /tmp/nm_conf_fixed ]; then
-                sudo mv /tmp/nm_conf_fixed /etc/NetworkManager/NetworkManager.conf
-            fi
-            # Step 2b: Add wlan1 ONLY to unmanaged-devices (CRITICAL for AP mode)
-            echo "      Step 1b: Adding wlan1 to unmanaged-devices (for AP mode)..."
-            if ! grep -q "^\[keyfile\]" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-                echo "" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-                echo "[keyfile]" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-            fi
-            if ! grep -q "unmanaged-devices=interface-name:wlan1" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-                echo "unmanaged-devices=interface-name:wlan1" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-            fi
+            echo "   🔧 AGGRESSIVE FINAL RECOVERY: Rewriting NetworkManager.conf..."
+            write_clean_nm_conf "wlan0" "wlan1"
+            echo "      ✅ Config rewritten"
             # Step 3: Stop wpa_supplicant
             echo "      Step 2: Stopping wpa_supplicant..."
             sudo systemctl stop wpa_supplicant 2>/dev/null || true

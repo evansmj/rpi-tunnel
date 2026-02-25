@@ -137,6 +137,47 @@ echo ""
 # - HOTEL_WIFI (onboard, $HOTEL_WIFI): Must be MANAGED for hotel connection
 # - AP_WIFI (USB adapter, $AP_WIFI): Must be UNMANAGED for hostapd access point
 # =============================================================================
+
+# Write a clean NetworkManager.conf from scratch (idempotent, no appending)
+write_clean_nm_conf() {
+    local hotel_iface="${1:-$HOTEL_WIFI}"
+    local ap_iface="${2:-$AP_WIFI}"
+    local nm_conf="/etc/NetworkManager/NetworkManager.conf"
+
+    hotel_iface="${hotel_iface:-wlan0}"
+    ap_iface="${ap_iface:-wlan1}"
+
+    sudo bash -c "cat > '$nm_conf'" << NMEOF
+[main]
+plugins=ifupdown,keyfile
+
+[ifupdown]
+managed=false
+
+[device]
+wifi.scan-rand-mac-address=no
+
+[device-hotel-wifi]
+match-device=interface-name:${hotel_iface}
+managed=1
+
+[device-ap-wifi]
+match-device=interface-name:${ap_iface}
+managed=0
+
+[keyfile]
+unmanaged-devices=interface-name:${ap_iface}
+NMEOF
+
+    local kf_count
+    kf_count=$(grep -c '^\[keyfile\]' "$nm_conf" 2>/dev/null || echo "0")
+    if [ "$kf_count" -ne 1 ]; then
+        echo "   ⚠️  NetworkManager.conf verification failed ($kf_count [keyfile] sections)"
+        return 1
+    fi
+    return 0
+}
+
 echo "=== Pre-flight check: Configuring Wi-Fi interface management ==="
 
 # Check if hotel WiFi interface exists
@@ -154,56 +195,35 @@ if ! ip link show "$AP_WIFI" >/dev/null 2>&1; then
 fi
 
 NM_CONF="/etc/NetworkManager/NetworkManager.conf"
-NM_CONF_CHANGED=false
 echo "   Checking NetworkManager configuration..."
 
-# Remove any old device-specific sections that might conflict
-for old_section in "device-wlan0" "device-wlan1" "device-hotel-wifi" "device-ap-wifi"; do
-    if grep -q "\[$old_section\]" "$NM_CONF" 2>/dev/null; then
-        echo "   Removing old [$old_section] section..."
-        sudo sed -i "/\[$old_section\]/,/^\[/{ /^\[/!d; /\[$old_section\]/d; }" "$NM_CONF" 2>/dev/null || true
-        NM_CONF_CHANGED=true
+# Detect corruption: null bytes, duplicate [keyfile] sections, or missing file
+NM_NEEDS_REWRITE=false
+if [ ! -f "$NM_CONF" ]; then
+    NM_NEEDS_REWRITE=true
+elif grep -Pq '\x00' "$NM_CONF" 2>/dev/null; then
+    echo "   ⚠️  Detected null bytes (file corruption) — rewriting..."
+    NM_NEEDS_REWRITE=true
+else
+    KEYFILE_COUNT=$(grep -c '^\[keyfile\]' "$NM_CONF" 2>/dev/null || echo "0")
+    if [ "$KEYFILE_COUNT" -ne 1 ]; then
+        echo "   ⚠️  Found $KEYFILE_COUNT [keyfile] sections (expected 1) — rewriting..."
+        NM_NEEDS_REWRITE=true
     fi
-done
-
-# Clean up any existing unmanaged-devices line
-if grep -q "^unmanaged-devices=" "$NM_CONF" 2>/dev/null; then
-    echo "   Cleaning up old unmanaged-devices setting..."
-    sudo sed -i "/^unmanaged-devices=/d" "$NM_CONF" 2>/dev/null || true
-    NM_CONF_CHANGED=true
+    DEVICE_HOTEL_COUNT=$(grep -c '^\[device-hotel-wifi\]' "$NM_CONF" 2>/dev/null || echo "0")
+    if [ "$DEVICE_HOTEL_COUNT" -ne 1 ]; then
+        NM_NEEDS_REWRITE=true
+    fi
 fi
 
-# Add proper configuration
-echo "   Adding NetworkManager configuration..."
-sudo bash -c "cat >> $NM_CONF" << EOF
-
-# Hotel Wi-Fi interface (onboard) - MANAGED by NetworkManager
-[device-hotel-wifi]
-match-device=interface-name:$HOTEL_WIFI
-managed=1
-
-# Access Point interface (USB adapter) - UNMANAGED (hostapd controls it)
-[device-ap-wifi]
-match-device=interface-name:$AP_WIFI
-managed=0
-
-[keyfile]
-unmanaged-devices=interface-name:$AP_WIFI
-EOF
-NM_CONF_CHANGED=true
-
-# Ensure HOTEL_WIFI is NOT in unmanaged-devices (it should be managed)
-if grep -q "unmanaged-devices.*$HOTEL_WIFI" "$NM_CONF" 2>/dev/null; then
-    echo "   Removing $HOTEL_WIFI from unmanaged-devices..."
-    sudo sed -i "s/interface-name:$HOTEL_WIFI[,;]*//g" "$NM_CONF" 2>/dev/null || true
-    NM_CONF_CHANGED=true
-fi
-
-# Restart NetworkManager if config changed
-if [ "$NM_CONF_CHANGED" = true ]; then
+if [ "$NM_NEEDS_REWRITE" = true ]; then
+    echo "   Writing clean NetworkManager configuration..."
+    write_clean_nm_conf "$HOTEL_WIFI" "$AP_WIFI"
     echo "   Restarting NetworkManager to apply config changes..."
     sudo systemctl restart NetworkManager 2>/dev/null || true
     sleep 5
+else
+    echo "   ✅ NetworkManager.conf is clean — no changes needed"
 fi
 
 # CRITICAL FIX: Check if hotel WiFi interface is managed by NetworkManager
@@ -325,87 +345,13 @@ echo ""
 # HELPER FUNCTION: Ensure NetworkManager config is correct and wlan0 stays managed
 # =============================================================================
 ensure_nm_wlan0_managed() {
-    # This function ensures wlan0 is NOT in unmanaged-devices and stays managed
-    # Call this BEFORE any NetworkManager restart to prevent wlan0 from becoming unmanaged
-    # CRITICAL: Removes ALL unmanaged-devices lines first to prevent duplicates
-    
-    # Ensure variables have defaults if not set
     local onboard_wifi="${ONBOARD_WIFI:-wlan0}"
     local usb_wifi="${USB_WIFI:-wlan1}"
-    
-    # Step 1: Remove ALL unmanaged-devices lines first (prevents duplicates)
-    sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    
-    # Step 2: Remove wlan0 from unmanaged-devices if present (safety check)
-    # This check happens AFTER removing all lines, so it's just a safety net
-    # We check the file again in case something added wlan0 back
-    if grep -q "unmanaged-devices.*wlan0\|unmanaged-devices.*$onboard_wifi" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-        sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=interface-name:$usb_wifi/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-        sudo sed -i "s/unmanaged-devices=.*$onboard_wifi.*/unmanaged-devices=interface-name:$usb_wifi/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-        # Also handle semicolon-separated lists
-        sudo sed -i "s/unmanaged-devices=interface-name:$onboard_wifi;interface-name:$usb_wifi/unmanaged-devices=interface-name:$usb_wifi/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-        sudo sed -i "s/unmanaged-devices=interface-name:$usb_wifi;interface-name:$onboard_wifi/unmanaged-devices=interface-name:$usb_wifi/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    fi
-    
-    # Step 2: Clean up duplicate [keyfile] sections
-    KEYFILE_COUNT=$(grep -c "^\[keyfile\]" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || echo "0")
-    if [ "$KEYFILE_COUNT" -gt 1 ]; then
-        # Remove all [keyfile] sections and add one clean one
-        sudo awk -v usb_wifi="$usb_wifi" '
-            BEGIN { in_keyfile=0; keyfile_added=0 }
-            /^\[keyfile\]/ { 
-                if (!keyfile_added) {
-                    print ""
-                    print "[keyfile]"
-                    print "unmanaged-devices=interface-name:" usb_wifi
-                    keyfile_added=1
-                }
-                in_keyfile=1
-                next
-            }
-            /^\[/ { 
-                if (in_keyfile) { in_keyfile=0 }
-                print
-                next
-            }
-            in_keyfile { next }
-            { print }
-            END {
-                if (!keyfile_added) {
-                    print ""
-                    print "[keyfile]"
-                    print "unmanaged-devices=interface-name:" usb_wifi
-                }
-            }
-        ' /etc/NetworkManager/NetworkManager.conf > /tmp/nm_conf_clean_func 2>/dev/null
-        if [ -f /tmp/nm_conf_clean_func ]; then
-            sudo mv /tmp/nm_conf_clean_func /etc/NetworkManager/NetworkManager.conf
-        fi
-    else
-        # No duplicate [keyfile] sections, but ensure [keyfile] section exists with unmanaged-devices
-        if ! grep -q "^\[keyfile\]" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-            echo "" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-            echo "[keyfile]" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-        fi
-        # Add unmanaged-devices line ONLY if it doesn't exist (we already removed all above)
-        if ! grep -q "unmanaged-devices=interface-name:$usb_wifi" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-            echo "unmanaged-devices=interface-name:$usb_wifi" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-        fi
-    fi
-    
-    # Step 3: Final safety check - ensure wlan0 is NOT in unmanaged-devices
-    if grep -q "unmanaged-devices.*wlan0\|unmanaged-devices.*$onboard_wifi" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-        # This should never happen, but fix it if it does
-        sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=interface-name:$usb_wifi/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-        sudo sed -i "s/unmanaged-devices=.*$onboard_wifi.*/unmanaged-devices=interface-name:$usb_wifi/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-        # Also handle semicolon-separated lists
-        sudo sed -i "s/unmanaged-devices=interface-name:$onboard_wifi;interface-name:$usb_wifi/unmanaged-devices=interface-name:$usb_wifi/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-        sudo sed -i "s/unmanaged-devices=interface-name:$usb_wifi;interface-name:$onboard_wifi/unmanaged-devices=interface-name:$usb_wifi/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    fi
-    
-    # Step 4: Set wlan0 to managed (before any restart)
+
+    write_clean_nm_conf "$onboard_wifi" "$usb_wifi"
+
     if systemctl is-active --quiet NetworkManager 2>/dev/null; then
-        sudo nmcli device set $onboard_wifi managed yes 2>/dev/null || true
+        sudo nmcli device set "$onboard_wifi" managed yes 2>/dev/null || true
         sudo nmcli radio wifi on 2>/dev/null || true
     fi
 }
@@ -452,54 +398,10 @@ force_wlan0_managed_after_restart() {
 # HELPER: Ensure NetworkManager config file is correct (prevents wlan0 from becoming unmanaged)
 # =============================================================================
 ensure_nm_config_correct() {
-    # This function ensures the config file has:
-    # 1. Only ONE [keyfile] section
-    # 2. Only ONE unmanaged-devices line (with ONLY USB Wi-Fi, NOT onboard Wi-Fi)
-    # 3. No duplicate lines
-    
-    # Ensure variables have defaults if not set
     local onboard_wifi="${ONBOARD_WIFI:-wlan0}"
     local usb_wifi="${USB_WIFI:-wlan1}"
-    
-    # Step 1: Remove ALL unmanaged-devices lines first
-    sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    
-    # Step 2: Remove all [keyfile] sections
-    sudo sed -i '/^\[keyfile\]$/,/^\[/ { /^\[keyfile\]$/d; /^\[/!d; }' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    sudo sed -i '/^\[keyfile\]$/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    
-    # Step 3: Add ONE clean [keyfile] section with ONLY wlan1
-    if ! grep -q "^\[keyfile\]" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-        echo "" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-        echo "[keyfile]" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-    fi
-    # Add unmanaged-devices line ONLY if it doesn't exist
-    if ! grep -q "unmanaged-devices=interface-name:$usb_wifi" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-        echo "unmanaged-devices=interface-name:$usb_wifi" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-    fi
-    
-    # Step 4: Verify wlan0 is NOT in unmanaged-devices (safety check)
-    if grep -q "unmanaged-devices.*wlan0\|unmanaged-devices.*$onboard_wifi" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-        # Remove wlan0 from the line
-        sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=interface-name:$usb_wifi/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-        sudo sed -i "s/unmanaged-devices=.*$onboard_wifi.*/unmanaged-devices=interface-name:$usb_wifi/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-        sudo sed -i "s/unmanaged-devices=interface-name:$onboard_wifi;interface-name:$usb_wifi/unmanaged-devices=interface-name:$usb_wifi/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-        sudo sed -i "s/unmanaged-devices=interface-name:$usb_wifi;interface-name:$onboard_wifi/unmanaged-devices=interface-name:$usb_wifi/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    fi
-    
-    # Step 5: Final verification - ensure no empty or malformed unmanaged-devices lines
-    # Remove any lines with empty interface names (these can cause NetworkManager to default incorrectly)
-    sudo sed -i '/unmanaged-devices=interface-name:$/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    sudo sed -i '/unmanaged-devices=interface-name:\s*$/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    
-    # If we removed the line and usb_wifi is set, add it back
-    if [ -n "$usb_wifi" ] && ! grep -q "unmanaged-devices=interface-name:$usb_wifi" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-        if ! grep -q "^\[keyfile\]" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-            echo "" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-            echo "[keyfile]" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-        fi
-        echo "unmanaged-devices=interface-name:$usb_wifi" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-    fi
+
+    write_clean_nm_conf "$onboard_wifi" "$usb_wifi"
 }
 
 # Call helper function at start to ensure config is correct from the beginning
@@ -905,14 +807,7 @@ else
                 else
                     echo "   ❌ Restart failed. wlan0 still unmanaged"
                     echo "   📋 Manual fix: Run ./fix-wlan0-unmanaged.sh"
-                    echo "   📋 Or run these commands:"
-                    echo "      sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf"
-                    echo "      echo '[keyfile]' | sudo tee -a /etc/NetworkManager/NetworkManager.conf"
-                    echo "      echo 'unmanaged-devices=interface-name:$USB_WIFI' | sudo tee -a /etc/NetworkManager/NetworkManager.conf"
-                    echo "      sudo systemctl restart NetworkManager"
-                    echo "      sleep 5"
-                    echo "      sudo nmcli device set wlan0 managed yes"
-                    echo "      nmcli device status | grep wlan0"
+                    echo "   📋 Or re-run this script which will rewrite NetworkManager.conf cleanly"
                 fi
             fi
         fi
@@ -1405,68 +1300,10 @@ echo "=== Configuring NetworkManager to ignore USB Wi-Fi (access point) only ===
 echo "   (NetworkManager will continue managing $ONBOARD_WIFI for nmtui)"
 echo "   (Only $USB_WIFI is unmanaged because it's in AP mode)"
 
-# Backup original config
-sudo cp /etc/NetworkManager/NetworkManager.conf /etc/NetworkManager/NetworkManager.conf.backup.$(date +%s) 2>/dev/null || true
-
-# Remove ALL unmanaged-devices lines (including any that might have wlan0)
-sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-
-# Clean up duplicate [keyfile] sections and add ONE clean [keyfile] section
-# Remove all [keyfile] sections and their content, then add one clean one with unmanaged-devices
-# CRITICAL: Also remove ALL unmanaged-devices lines first to prevent duplicates
-sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-sudo awk -v usb_wifi="$USB_WIFI" '
-    BEGIN { in_keyfile=0; keyfile_added=0 }
-    /^\[keyfile\]/ { 
-        if (!keyfile_added) {
-            print ""
-            print "[keyfile]"
-            print "unmanaged-devices=interface-name:" usb_wifi
-            keyfile_added=1
-        }
-        in_keyfile=1
-        next
-    }
-    /^\[/ { 
-        if (in_keyfile) { in_keyfile=0 }
-        print
-        next
-    }
-    in_keyfile { next }
-    { print }
-    END {
-        if (!keyfile_added) {
-            print ""
-            print "[keyfile]"
-            print "unmanaged-devices=interface-name:" usb_wifi
-        }
-    }
-' /etc/NetworkManager/NetworkManager.conf > /tmp/nm_conf_clean 2>/dev/null
-if [ -f /tmp/nm_conf_clean ]; then
-    sudo mv /tmp/nm_conf_clean /etc/NetworkManager/NetworkManager.conf
-    echo "✅ Cleaned up duplicate [keyfile] sections and added clean config"
-else
-    echo "⚠️  Could not clean config file - attempting alternative method..."
-    # Alternative: Just remove all [keyfile] sections and append one
-    sudo sed -i '/^\[keyfile\]/,/^\[/ { /^\[keyfile\]/d; /^\[/!d; }' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    sudo sed -i '/^\[keyfile\]$/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    # Remove any unmanaged-devices lines
-    sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    # Append clean [keyfile] section
-    echo "" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-    echo "[keyfile]" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-    echo "unmanaged-devices=interface-name:$USB_WIFI" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-fi
-
-# CRITICAL: Verify wlan0 is NOT in unmanaged-devices
-echo "Verifying wlan0 is NOT in unmanaged-devices..."
-if grep -q "unmanaged-devices.*wlan0\|unmanaged-devices.*$ONBOARD_WIFI" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-    echo "   ⚠️  WARNING: wlan0 found in unmanaged-devices! Removing it..."
-    # Remove wlan0 from unmanaged-devices if it's there
-    sudo sed -i "s/unmanaged-devices=interface-name:$ONBOARD_WIFI;interface-name:$USB_WIFI/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    sudo sed -i "s/unmanaged-devices=interface-name:$USB_WIFI;interface-name:$ONBOARD_WIFI/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    sudo sed -i "s/unmanaged-devices=interface-name:$ONBOARD_WIFI/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-fi
+# Write a clean NetworkManager.conf from scratch (replaces all awk/sed cleanup)
+echo "Writing clean NetworkManager configuration..."
+write_clean_nm_conf "$ONBOARD_WIFI" "$USB_WIFI"
+echo "✅ NetworkManager.conf is clean"
 
 # Ensure USB Wi-Fi is explicitly unmanaged
 echo "Ensuring USB Wi-Fi ($USB_WIFI) is unmanaged (AP mode)..."
@@ -1575,25 +1412,8 @@ else
     echo "⚠️  $ONBOARD_WIFI status: $(echo "$NM_WLAN0_FINAL" | awk '{print $3}' || echo 'not found')"
     echo "   🔧 Attempting AGGRESSIVE emergency fix..."
     
-    # Step 1: Verify config file doesn't have wlan0 in unmanaged-devices
-    echo "   Step 1: Cleaning config file..."
-    sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null
-    # Remove all [keyfile] sections
-    sudo sed -i '/^\[keyfile\]$/,/^\[/ { /^\[keyfile\]$/d; /^\[/!d; }' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    sudo sed -i '/^\[keyfile\]$/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    # Add clean [keyfile] section with ONLY USB Wi-Fi
-    if ! grep -q "^\[keyfile\]" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-        echo "" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-        echo "[keyfile]" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-        echo "unmanaged-devices=interface-name:$USB_WIFI" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-    fi
-    
-    # Step 2: Verify wlan0 is NOT in unmanaged-devices
-    if grep -q "unmanaged-devices.*$ONBOARD_WIFI\|unmanaged-devices.*wlan0" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-        echo "   ⚠️  Found wlan0 in unmanaged-devices! Removing..."
-        sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-        sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    fi
+    echo "   Step 1: Rewriting clean NetworkManager config..."
+    write_clean_nm_conf "$ONBOARD_WIFI" "$USB_WIFI"
     
     # Step 3: Restart NetworkManager
     echo "   Step 2: Restarting NetworkManager..."
@@ -1608,12 +1428,7 @@ else
         echo "   ✅ Emergency fix successful! $ONBOARD_WIFI is now: $(echo "$NM_WLAN0_AFTER_FIX" | awk '{print $3}')"
     else
         echo "   ❌ Emergency fix failed. $ONBOARD_WIFI status: $(echo "$NM_WLAN0_AFTER_FIX" | awk '{print $3}' || echo 'not found')"
-        echo "   📋 Manual fix required. Run these commands:"
-        echo "      sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf"
-        echo "      echo '[keyfile]' | sudo tee -a /etc/NetworkManager/NetworkManager.conf"
-        echo "      echo 'unmanaged-devices=interface-name:$USB_WIFI' | sudo tee -a /etc/NetworkManager/NetworkManager.conf"
-        echo "      sudo systemctl restart NetworkManager"
-        echo "      sleep 5"
+        echo "   📋 Manual fix required: Re-run ./tunnel.sh (it will rewrite NetworkManager.conf cleanly)"
         echo "      sudo nmcli device set $ONBOARD_WIFI managed yes"
         echo "      sudo nmcli radio wifi on"
     fi
@@ -2365,17 +2180,9 @@ if [ -n "$NM_WLAN0_FINAL_CHECK" ] && ! echo "$NM_WLAN0_FINAL_CHECK" | grep -qE "
 else
     echo "⚠️  $ONBOARD_WIFI is NOT managed! Attempting aggressive fix..."
     
-    # Step 1: Ensure config is correct
-    sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null
-    if ! grep -q "^\[keyfile\]" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-        echo "" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-        echo "[keyfile]" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-    fi
-    if ! grep -q "unmanaged-devices=interface-name:$USB_WIFI" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-        echo "unmanaged-devices=interface-name:$USB_WIFI" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-    fi
+    write_clean_nm_conf "$ONBOARD_WIFI" "$USB_WIFI"
     
-    # Step 2: Reload NetworkManager config
+    # Reload NetworkManager config
     sudo nmcli general reload 2>/dev/null || true
     sleep 3
     
@@ -2396,11 +2203,8 @@ else
     else
         echo "❌ Could not fix automatically. $ONBOARD_WIFI status: $(echo "$NM_WLAN0_LAST_CHECK" | awk '{print $3}' || echo 'not found')"
         echo ""
-        echo "📋 Please run these commands manually:"
-        echo "   sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf"
-        echo "   echo '[keyfile]' | sudo tee -a /etc/NetworkManager/NetworkManager.conf"
-        echo "   echo 'unmanaged-devices=interface-name:$USB_WIFI' | sudo tee -a /etc/NetworkManager/NetworkManager.conf"
-        echo "   sudo systemctl restart NetworkManager"
+        echo "📋 Please re-run ./tunnel.sh (it will rewrite NetworkManager.conf cleanly)"
+        echo "   Or manually: sudo systemctl restart NetworkManager"
         echo "   sleep 8"
         echo "   sudo nmcli device set $ONBOARD_WIFI managed yes"
         echo "   sudo nmcli device set $ONBOARD_WIFI managed yes"
@@ -2422,20 +2226,7 @@ else
     echo "❌ FINAL: $ONBOARD_WIFI became unmanaged! Status: $(echo "$FINAL_FINAL_CHECK" | awk '{print $3}' || echo 'not found')"
     echo ""
     echo "🔧 LAST RESORT FIX - Running one more time..."
-    # Remove wlan0 from config one more time
-    sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf 2>/dev/null
-    if ! grep -q "^\[keyfile\]" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-        echo "" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-        echo "[keyfile]" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-    fi
-    if ! grep -q "unmanaged-devices=interface-name:$USB_WIFI" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-        echo "unmanaged-devices=interface-name:$USB_WIFI" | sudo tee -a /etc/NetworkManager/NetworkManager.conf > /dev/null
-    fi
-    # Verify wlan0 is NOT in there
-    if grep -q "unmanaged-devices.*wlan0\|unmanaged-devices.*$ONBOARD_WIFI" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-        sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-        sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    fi
+    write_clean_nm_conf "$ONBOARD_WIFI" "$USB_WIFI"
     # Reload and set managed
     sudo nmcli general reload 2>/dev/null || true
     sleep 3
@@ -2509,14 +2300,7 @@ if [ "$FINAL_STATUS" = "unmanaged" ] || [ "$FINAL_STATUS" = "unavailable" ]; the
         echo "   ✅ Fixed! wlan0 is now: $ABSOLUTE_FINAL"
     else
         echo "   ❌ FAILED. wlan0 is still unmanaged: $ABSOLUTE_FINAL"
-        echo "   📋 Run this manually:"
-        echo "      sudo sed -i '/unmanaged-devices/d' /etc/NetworkManager/NetworkManager.conf"
-        echo "      sudo find /etc/NetworkManager/conf.d/ -name '*.conf' -exec sed -i '/unmanaged-devices.*wlan0/d' {} \\;"
-        echo "      echo '[keyfile]' | sudo tee -a /etc/NetworkManager/NetworkManager.conf"
-        echo "      echo 'unmanaged-devices=interface-name:$USB_WIFI' | sudo tee -a /etc/NetworkManager/NetworkManager.conf"
-        echo "      sudo systemctl restart NetworkManager"
-        echo "      sleep 5"
-        echo "      sudo nmcli device set wlan0 managed yes"
+        echo "   📋 Re-run ./tunnel.sh (it will rewrite NetworkManager.conf cleanly)"
     fi
 else
     echo "   ✅ wlan0 status: $FINAL_STATUS"
