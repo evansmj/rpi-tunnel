@@ -312,6 +312,18 @@ else
     echo "   IP address: NONE"
 fi
 
+# Clear stale Tailscale exit node BEFORE testing connectivity.
+# A previous tunnel.sh run may have configured Tailscale to route all traffic
+# through the exit node. If the tunnel isn't fully set up, this blackholes all traffic.
+if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
+    CURRENT_EXIT_NODE=$(tailscale status --json 2>/dev/null | grep -o '"ExitNodeStatus":{[^}]*}' || echo "")
+    if [ -n "$CURRENT_EXIT_NODE" ] && [ "$CURRENT_EXIT_NODE" != '{}' ]; then
+        echo "   ⚠️  Tailscale exit node is active — clearing it to test raw internet..."
+        sudo tailscale up --exit-node= --accept-routes=false 2>/dev/null || true
+        sleep 2
+    fi
+fi
+
 # Test internet connectivity BEFORE making any changes
 echo "   Testing internet connectivity..."
 if ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
@@ -1065,8 +1077,9 @@ fi
 # Ask if user wants to update packages (if dependencies are installed)
 if [ "$UPDATE_PACKAGES" = "n" ] && [ -t 0 ] && [ -t 1 ]; then
     echo ""
-    read -p "   Update system packages? (y/n) [n]: " UPDATE_PACKAGES
+    read -t 5 -p "   Update system packages? (y/n) [n]: " UPDATE_PACKAGES || true
     UPDATE_PACKAGES=${UPDATE_PACKAGES:-n}
+    echo ""
 fi
 
 if [[ "$UPDATE_PACKAGES" =~ ^[Yy]$ ]]; then
@@ -1111,11 +1124,11 @@ echo "Configuring DNS for Tailscale compatibility..."
 sudo systemctl stop systemd-resolved 2>/dev/null || true
 sudo systemctl disable systemd-resolved 2>/dev/null || true
 
-# Create a simple resolv.conf that Tailscale can manage
+# Write Tailscale DNS directly into resolv.conf.
+# With systemd-resolved disabled, Tailscale often cannot update resolv.conf on its own.
+# ONLY Tailscale DNS is used -- no public fallback to prevent DNS leaks.
 sudo rm -f /etc/resolv.conf
-echo "nameserver 127.0.0.1" | sudo tee /etc/resolv.conf > /dev/null
-echo "nameserver ::1" | sudo tee -a /etc/resolv.conf > /dev/null
-# Don't make it immutable - let Tailscale manage it
+echo "nameserver 100.100.100.100" | sudo tee /etc/resolv.conf > /dev/null
 
 echo "=== Installing Tailscale (from official repo) ==="
 if curl -fsSL https://tailscale.com/install.sh | sh; then
@@ -1973,17 +1986,43 @@ else
     # Verify DNS is properly configured
     echo ""
     echo "Verifying DNS configuration..."
-    sleep 2
+    
+    # Remove immutable flag if still set from earlier package-update protection
     if lsattr /etc/resolv.conf 2>/dev/null | grep -q "i"; then
-        echo "⚠️  Warning: /etc/resolv.conf is still immutable - removing flag..."
+        echo "   Removing immutable flag from /etc/resolv.conf..."
         sudo chattr -i /etc/resolv.conf 2>/dev/null || true
     fi
     
-    # Check if Tailscale is managing DNS
+    # Give Tailscale a moment to update resolv.conf
+    sleep 3
+    
+    # Check if Tailscale is managing DNS; if not, force it
     if grep -q "100.100.100.100" /etc/resolv.conf 2>/dev/null; then
         echo "✅ Tailscale DNS is active"
     else
-        echo "⚠️  Tailscale DNS not detected in resolv.conf - may need manual configuration"
+        echo "   Tailscale DNS not detected in resolv.conf - forcing Tailscale DNS..."
+        
+        # Tailscale on Linux without systemd-resolved often cannot write resolv.conf
+        # on its own. Write it directly to prevent DNS leaks.
+        # ONLY Tailscale DNS -- no public fallback to prevent DNS leaks.
+        sudo chattr -i /etc/resolv.conf 2>/dev/null || true
+        sudo rm -f /etc/resolv.conf
+        echo "nameserver 100.100.100.100" | sudo tee /etc/resolv.conf > /dev/null
+        
+        # Verify the write worked
+        if grep -q "100.100.100.100" /etc/resolv.conf 2>/dev/null; then
+            echo "✅ Tailscale DNS forced into resolv.conf"
+        else
+            echo "❌ Failed to write Tailscale DNS to resolv.conf"
+        fi
+        
+        # Verify DNS actually resolves through Tailscale
+        sleep 1
+        if ping -c 1 -W 3 google.com >/dev/null 2>&1; then
+            echo "✅ DNS resolution working through Tailscale"
+        else
+            echo "⚠️  DNS resolution not working yet (Tailscale DNS may need a moment)"
+        fi
     fi
     
     echo "✅ Tailscale routing configured"
@@ -2054,6 +2093,7 @@ fi
 echo ""
 echo "5️⃣ Internet Connectivity Test:"
 echo "   🔍 Debug: Testing basic connectivity..."
+EXIT_NODE_WORKING=false
 
 # Test 1: Can we reach internet via IP?
 if ping -c 1 8.8.8.8 >/dev/null 2>&1; then
@@ -2077,8 +2117,9 @@ if timeout 10 curl -s ifconfig.me > /tmp/myip 2>/dev/null; then
     MYIP=$(cat /tmp/myip)
     if [ "$MYIP" = "$TAILSCALE_EXPECTED_IP" ]; then
         echo "   ✅ Internet working through exit node ($MYIP)"
+        EXIT_NODE_WORKING=true
     else
-        echo "   ⚠️  Internet working but not through exit node ($MYIP)"
+        echo "   ❌ Internet working but NOT through exit node ($MYIP)"
         echo "   🔍 Expected: $TAILSCALE_EXPECTED_IP, Got: $MYIP"
     fi
     rm -f /tmp/myip
@@ -2099,6 +2140,26 @@ if sudo nft list table ip nat 2>/dev/null | grep -q 'oifname "tailscale0" masque
     echo "   ✅ NAT rules configured for Tailscale"
 else
     echo "   ❌ NAT rules missing or incorrect"
+fi
+
+# Check 7: DNS Leak
+echo ""
+echo "7️⃣ DNS Leak Check:"
+if grep -q "100.100.100.100" /etc/resolv.conf 2>/dev/null; then
+    echo "   ✅ Tailscale DNS (100.100.100.100) is primary in resolv.conf"
+else
+    echo "   ❌ DNS LEAK: Tailscale DNS not in resolv.conf!"
+    echo "   🔍 Current resolv.conf:"
+    grep nameserver /etc/resolv.conf 2>/dev/null | head -3 | while read -r line; do echo "      $line"; done
+    echo "   🔧 Fixing DNS leak now..."
+    sudo chattr -i /etc/resolv.conf 2>/dev/null || true
+    sudo rm -f /etc/resolv.conf
+    echo "nameserver 100.100.100.100" | sudo tee /etc/resolv.conf > /dev/null
+    if grep -q "100.100.100.100" /etc/resolv.conf 2>/dev/null; then
+        echo "   ✅ DNS leak fixed - Tailscale DNS is now primary"
+    else
+        echo "   ❌ Failed to fix DNS leak"
+    fi
 fi
 
 # Summary
@@ -2122,7 +2183,7 @@ if sudo tailscale status | grep -q "$TAILSCALE_EXIT_NODE_NAME.*active.*exit node
 if ! ip route show | grep -q "0.0.0.0/1 dev tailscale0" && ! ip route show | grep -q "128.0.0.0/1 dev tailscale0"; then ((CHECKS_PASSED++)); fi
 if systemctl is-active --quiet tunnel-watchdog; then ((CHECKS_PASSED++)); fi
 
-if [ $CHECKS_PASSED -eq 6 ]; then
+if [ "$EXIT_NODE_WORKING" = true ] && [ $CHECKS_PASSED -eq 6 ]; then
     echo "🎉 ALL SYSTEMS GO! Your tunnel is ready!"
     echo "   Connect your devices to '$AP_SSID' and enjoy secure browsing!"
 elif [ $CHECKS_PASSED -ge 3 ]; then
@@ -2131,6 +2192,29 @@ elif [ $CHECKS_PASSED -ge 3 ]; then
 else
     echo "❌ SETUP INCOMPLETE - Multiple issues detected"
     echo "   Please review the checks above and fix the issues"
+fi
+
+# CRITICAL: Fail the script if traffic is not going through the exit node
+if [ "$EXIT_NODE_WORKING" != true ]; then
+    echo ""
+    echo "❌ =========================================="
+    echo "❌  TUNNEL SETUP FAILED"
+    echo "❌ =========================================="
+    echo ""
+    echo "   Traffic is NOT going through your exit node."
+    echo "   Expected IP: $TAILSCALE_EXPECTED_IP"
+    echo ""
+    echo "   Possible causes:"
+    echo "   1. Exit node '$TAILSCALE_EXIT_NODE_NAME' ($TAILSCALE_EXIT_NODE_IP) is not advertising as an exit node"
+    echo "      Fix on the exit node machine: sudo tailscale up --advertise-exit-node"
+    echo "   2. Exit node is offline or unreachable"
+    echo "      Check: sudo tailscale status | grep $TAILSCALE_EXIT_NODE_NAME"
+    echo "   3. Tailscale routing is misconfigured"
+    echo "      Check: sudo tailscale status"
+    echo ""
+    echo "   After fixing, re-run: ./tunnel.sh"
+    echo ""
+    exit 1
 fi
 
 echo ""
