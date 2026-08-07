@@ -65,6 +65,103 @@ echo "   AP Network: $AP_IP_RANGE.0/24"
 echo ""
 
 # =============================================================================
+# CONFIGURE Wi-Fi REGULATORY DOMAIN
+# =============================================================================
+
+configure_wifi_regulatory_domain() {
+    local reg_country="${1:-${REGULATORY_COUNTRY:-US}}"
+    local cfg_file="/etc/modprobe.d/cfg80211.conf"
+
+    if [ -z "$reg_country" ]; then
+        echo "⚠️  No regulatory country configured; skipping Wi-Fi regulatory domain setup"
+        return 0
+    fi
+
+    echo "=== Configuring Wi-Fi regulatory domain ($reg_country) ==="
+
+    if command -v iw >/dev/null 2>&1; then
+        if sudo iw reg set "$reg_country" 2>/dev/null; then
+            CURRENT_REG=$(iw reg get 2>/dev/null | awk '/^country / {gsub(":", "", $2); print $2; exit}' || echo "unknown")
+            echo "   ✅ Active regulatory domain: $CURRENT_REG"
+        else
+            echo "   ⚠️  Could not set active regulatory domain with iw"
+        fi
+    else
+        echo "   ⚠️  iw is not installed yet; persistent regulatory domain will still be configured"
+    fi
+
+    # Make the setting survive reboots so scans include the correct country channels.
+    if [ -d "/etc/modprobe.d" ]; then
+        if [ -f "$cfg_file" ] && sudo grep -Eq '^[[:space:]]*options[[:space:]]+cfg80211.*ieee80211_regdom=' "$cfg_file"; then
+            sudo sed -i -E "s/(ieee80211_regdom=)[A-Za-z0-9_]+/\1$reg_country/g" "$cfg_file"
+        elif [ -f "$cfg_file" ] && sudo grep -Eq '^[[:space:]]*options[[:space:]]+cfg80211([[:space:]]|$)' "$cfg_file"; then
+            sudo sed -i -E "/^[[:space:]]*options[[:space:]]+cfg80211([[:space:]]|$)/s/$/ ieee80211_regdom=$reg_country/" "$cfg_file"
+        else
+            echo "options cfg80211 ieee80211_regdom=$reg_country" | sudo tee "$cfg_file" >/dev/null
+        fi
+        echo "   ✅ Persistent regulatory domain configured in $cfg_file"
+    else
+        echo "   ⚠️  /etc/modprobe.d not found; could not configure persistent regulatory domain"
+    fi
+    echo ""
+}
+
+ensure_tailscale_installed() {
+    if command -v tailscale >/dev/null 2>&1; then
+        echo "✅ Tailscale is already installed ($(tailscale --version 2>/dev/null | head -n 1)); skipping install"
+        return 0
+    fi
+
+    echo "=== Installing Tailscale (from official repo) ==="
+    echo "   Tailscale command not found; installing before VPN setup..."
+
+    sudo chattr -i /etc/resolv.conf 2>/dev/null || true
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "❌ curl is required to install Tailscale but is not available"
+        echo "   Install curl first, then rerun this script."
+        return 1
+    fi
+
+    if curl -fsSL https://tailscale.com/install.sh | sh; then
+        if command -v tailscale >/dev/null 2>&1; then
+            echo "✅ Tailscale installation completed"
+            return 0
+        fi
+    fi
+
+    echo "❌ Tailscale installation failed"
+    echo "   Check internet and DNS connectivity, then rerun this script:"
+    echo "   ping -c 3 8.8.8.8"
+    echo "   ping -c 3 tailscale.com"
+    return 1
+}
+
+ensure_tailscale_authenticated() {
+    echo "=== Checking Tailscale authentication ==="
+
+    sudo systemctl enable --now tailscaled 2>/dev/null || sudo systemctl start tailscaled 2>/dev/null || true
+    sleep 2
+
+    if sudo tailscale ip -4 >/dev/null 2>&1; then
+        echo "✅ Tailscale is authenticated"
+        return 0
+    fi
+
+    echo "❌ Tailscale is installed but not authenticated"
+    echo "   Aborting before tunnel DNS/routing changes so normal internet remains usable."
+    echo ""
+    echo "   Run this first, complete the browser login, then rerun this script:"
+    echo "   sudo tailscale up"
+    echo ""
+    echo "   Current Tailscale status:"
+    sudo tailscale status 2>&1 | head -5 || true
+    return 1
+}
+
+configure_wifi_regulatory_domain "${REGULATORY_COUNTRY:-US}"
+
+# =============================================================================
 # DETECT Wi-Fi INTERFACES EARLY (needed for NetworkManager config functions)
 # =============================================================================
 echo "=== Detecting Wi-Fi interfaces ==="
@@ -1113,6 +1210,16 @@ else
     echo "=== All dependencies already installed, skipping installation ==="
 fi
 
+if ! ensure_tailscale_installed; then
+    echo "❌ EXITING: Tailscale is required before tunnel routing can be configured"
+    exit 1
+fi
+
+if ! ensure_tailscale_authenticated; then
+    echo "❌ EXITING: Authenticate Tailscale before running tunnel setup"
+    exit 1
+fi
+
 # Restore normal DNS management after package updates
 echo "=== Restoring DNS management ==="
 sudo chattr -i /etc/resolv.conf 2>/dev/null || true
@@ -1129,14 +1236,6 @@ sudo systemctl disable systemd-resolved 2>/dev/null || true
 # ONLY Tailscale DNS is used -- no public fallback to prevent DNS leaks.
 sudo rm -f /etc/resolv.conf
 echo "nameserver 100.100.100.100" | sudo tee /etc/resolv.conf > /dev/null
-
-echo "=== Installing Tailscale (from official repo) ==="
-if curl -fsSL https://tailscale.com/install.sh | sh; then
-    echo "✅ Tailscale installation completed"
-else
-    echo "⚠️  Tailscale installation failed, but continuing..."
-    echo "   💡 Tailscale may already be installed, or you may need to install it manually"
-fi
 
 echo "=== Stop services while we configure ==="
 sudo systemctl stop hostapd || true
@@ -1241,21 +1340,7 @@ echo "=== Configuring Wi-Fi access point on $USB_WIFI ==="
 # =============================================================================
 # SET REGULATORY DOMAIN FOR 5GHz CHANNELS
 # =============================================================================
-echo "=== Setting regulatory domain for 5GHz channels ==="
-# Set regulatory domain to enable proper 5GHz channels (especially UNII-3: 149-165)
-# This ensures 5GHz channels work properly regardless of system default
-REG_COUNTRY="${REGULATORY_COUNTRY:-US}"
-if sudo iw reg set "$REG_COUNTRY" 2>/dev/null; then
-    CURRENT_REG=$(iw reg get 2>/dev/null | grep "country" | head -1 | awk '{print $2}' || echo "unknown")
-    echo "   ✅ Regulatory domain set to: $CURRENT_REG"
-    if [ "$CURRENT_REG" != "$REG_COUNTRY" ]; then
-        echo "   ⚠️  Warning: Requested $REG_COUNTRY but got $CURRENT_REG (may need root or different method)"
-    fi
-else
-    echo "   ⚠️  Could not set regulatory domain (may require different permissions)"
-    echo "   💡 You can manually set it with: sudo iw reg set $REG_COUNTRY"
-fi
-echo ""
+configure_wifi_regulatory_domain "${REGULATORY_COUNTRY:-US}"
 
 # Properly configure the USB Wi-Fi interface for AP mode
 echo "Setting up $USB_WIFI for Access Point mode..."
@@ -1461,6 +1546,8 @@ driver=nl80211
 ssid=$AP_SSID
 hw_mode=$HOSTAPD_HW_MODE
 channel=${AP_CHANNEL:-6}
+country_code=${REGULATORY_COUNTRY:-US}
+ieee80211d=1
 wmm_enabled=1
 macaddr_acl=0
 auth_algs=1
@@ -1919,114 +2006,112 @@ sudo systemctl --no-pager status dnsmasq
 echo "=== Configuring Tailscale routing ==="
 echo "Checking if Tailscale is authenticated..."
 
-if sudo tailscale status | grep -q "logged out\|not logged in"; then
-    echo "⚠️  Tailscale needs authentication. Run these commands manually:"
-    echo "   sudo tailscale up"
-    echo "   (Follow the URL to authenticate)"
-    echo "   sudo tailscale up --exit-node=$TAILSCALE_EXIT_NODE_IP --exit-node-allow-lan-access=false --accept-routes --accept-dns"
-    echo "   sudo ip route add default dev tailscale0 metric 0"
-else
-    echo "Tailscale is authenticated. Configuring exit node and routing..."
-    echo "   Attempting to connect to exit node: $TAILSCALE_EXIT_NODE_IP"
-    echo "   (This may take up to 30 seconds if the exit node is not immediately reachable)..."
-    
-    # Use timeout to prevent hanging indefinitely (30 seconds should be enough)
-    # Also redirect stderr to capture any errors
-    if timeout 30 sudo tailscale up --exit-node=$TAILSCALE_EXIT_NODE_IP --exit-node-allow-lan-access=false --accept-routes --accept-dns 2>&1; then
-        echo "   ✅ Tailscale exit node connection command completed"
-    else
-        EXIT_CODE=$?
-        if [ $EXIT_CODE -eq 124 ]; then
-            echo "   ⚠️  WARNING: tailscale up command timed out after 30 seconds"
-            echo "   💡 This usually means the exit node is not reachable or there's a network issue"
-            echo "   💡 The connection may still work - checking status..."
-        else
-            echo "   ⚠️  WARNING: tailscale up command failed with exit code $EXIT_CODE"
-            echo "   💡 This may be normal if the exit node is not immediately available"
-            echo "   💡 Checking current Tailscale status..."
-        fi
-    fi
-    
-    sleep 3
-    
-    # Remove any existing incomplete Tailscale routes
-    sudo ip route del default dev tailscale0 2>/dev/null || true
-    sudo ip route del 0.0.0.0/1 dev tailscale0 2>/dev/null || true
-    sudo ip route del 128.0.0.0/1 dev tailscale0 2>/dev/null || true
-    
-    # Fix Tailscale hijacking local access point traffic
-    sudo ip rule add from ${AP_IP_RANGE}.0/24 to ${AP_IP_RANGE}.0/24 table main priority 100 2>/dev/null || echo "Local routing rule already exists"
-    sudo ip rule add to ${AP_IP_RANGE}.0/24 table main priority 50 2>/dev/null || echo "Return traffic routing rule already exists"
-    
-    # Fix Tailscale hijacking local home network traffic
-    # Get local network from wlan0 (home WiFi)
-    if ip addr show $ONBOARD_WIFI 2>/dev/null | grep -q "inet "; then
-        LOCAL_NET=$(ip route show dev $ONBOARD_WIFI | grep -E "^[0-9]" | head -1 | awk '{print $1}')
-        if [ -n "$LOCAL_NET" ] && [ "$LOCAL_NET" != "${AP_IP_RANGE}.0/24" ]; then
-            echo "Excluding local network $LOCAL_NET from Tailscale routing..."
-            sudo ip rule add from $LOCAL_NET to $LOCAL_NET table main priority 90 2>/dev/null || echo "Local network routing rule already exists"
-            sudo ip rule add to $LOCAL_NET table main priority 40 2>/dev/null || echo "Local network return routing rule already exists"
-        fi
-    fi
-    
-    # Let Tailscale handle its own routing when using exit nodes
-    echo "✅ Letting Tailscale manage exit node routing automatically"
-    
-    # Check if exit node is actually active (may not be if connection failed)
-    echo ""
-    echo "Verifying exit node connection..."
-    if sudo tailscale status 2>/dev/null | grep -q "$TAILSCALE_EXIT_NODE_NAME.*active.*exit node"; then
-        echo "   ✅ Exit node is active and connected!"
-    else
-        echo "   ⚠️  Exit node is not yet active (this is normal if network is still connecting)"
-        echo "   💡 The exit node will connect automatically when network is available"
-        echo "   💡 You can check status later with: sudo tailscale status"
-    fi
-    
-    # Verify DNS is properly configured
-    echo ""
-    echo "Verifying DNS configuration..."
-    
-    # Remove immutable flag if still set from earlier package-update protection
-    if lsattr /etc/resolv.conf 2>/dev/null | grep -q "i"; then
-        echo "   Removing immutable flag from /etc/resolv.conf..."
-        sudo chattr -i /etc/resolv.conf 2>/dev/null || true
-    fi
-    
-    # Give Tailscale a moment to update resolv.conf
-    sleep 3
-    
-    # Check if Tailscale is managing DNS; if not, force it
-    if grep -q "100.100.100.100" /etc/resolv.conf 2>/dev/null; then
-        echo "✅ Tailscale DNS is active"
-    else
-        echo "   Tailscale DNS not detected in resolv.conf - forcing Tailscale DNS..."
-        
-        # Tailscale on Linux without systemd-resolved often cannot write resolv.conf
-        # on its own. Write it directly to prevent DNS leaks.
-        # ONLY Tailscale DNS -- no public fallback to prevent DNS leaks.
-        sudo chattr -i /etc/resolv.conf 2>/dev/null || true
-        sudo rm -f /etc/resolv.conf
-        echo "nameserver 100.100.100.100" | sudo tee /etc/resolv.conf > /dev/null
-        
-        # Verify the write worked
-        if grep -q "100.100.100.100" /etc/resolv.conf 2>/dev/null; then
-            echo "✅ Tailscale DNS forced into resolv.conf"
-        else
-            echo "❌ Failed to write Tailscale DNS to resolv.conf"
-        fi
-        
-        # Verify DNS actually resolves through Tailscale
-        sleep 1
-        if ping -c 1 -W 3 google.com >/dev/null 2>&1; then
-            echo "✅ DNS resolution working through Tailscale"
-        else
-            echo "⚠️  DNS resolution not working yet (Tailscale DNS may need a moment)"
-        fi
-    fi
-    
-    echo "✅ Tailscale routing configured"
+if ! sudo tailscale ip -4 >/dev/null 2>&1; then
+    echo "❌ EXITING: Tailscale authentication was lost; leaving routing unchanged"
+    sudo tailscale status 2>&1 | head -5 || true
+    exit 1
 fi
+
+echo "Tailscale is authenticated. Configuring exit node and routing..."
+echo "   Attempting to connect to exit node: $TAILSCALE_EXIT_NODE_IP"
+echo "   (This may take up to 30 seconds if the exit node is not immediately reachable)..."
+
+# Use timeout to prevent hanging indefinitely (30 seconds should be enough)
+# Also redirect stderr to capture any errors
+if timeout 30 sudo tailscale up --exit-node=$TAILSCALE_EXIT_NODE_IP --exit-node-allow-lan-access=false --accept-routes --accept-dns 2>&1; then
+    echo "   ✅ Tailscale exit node connection command completed"
+else
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 124 ]; then
+        echo "   ⚠️  WARNING: tailscale up command timed out after 30 seconds"
+        echo "   💡 This usually means the exit node is not reachable or there's a network issue"
+        echo "   💡 The connection may still work - checking status..."
+    else
+        echo "   ⚠️  WARNING: tailscale up command failed with exit code $EXIT_CODE"
+        echo "   💡 This may be normal if the exit node is not immediately available"
+        echo "   💡 Checking current Tailscale status..."
+    fi
+fi
+
+sleep 3
+
+# Remove any existing incomplete Tailscale routes
+sudo ip route del default dev tailscale0 2>/dev/null || true
+sudo ip route del 0.0.0.0/1 dev tailscale0 2>/dev/null || true
+sudo ip route del 128.0.0.0/1 dev tailscale0 2>/dev/null || true
+
+# Fix Tailscale hijacking local access point traffic
+sudo ip rule add from ${AP_IP_RANGE}.0/24 to ${AP_IP_RANGE}.0/24 table main priority 100 2>/dev/null || echo "Local routing rule already exists"
+sudo ip rule add to ${AP_IP_RANGE}.0/24 table main priority 50 2>/dev/null || echo "Return traffic routing rule already exists"
+
+# Fix Tailscale hijacking local home network traffic
+# Get local network from wlan0 (home WiFi)
+if ip addr show $ONBOARD_WIFI 2>/dev/null | grep -q "inet "; then
+    LOCAL_NET=$(ip route show dev $ONBOARD_WIFI | grep -E "^[0-9]" | head -1 | awk '{print $1}')
+    if [ -n "$LOCAL_NET" ] && [ "$LOCAL_NET" != "${AP_IP_RANGE}.0/24" ]; then
+        echo "Excluding local network $LOCAL_NET from Tailscale routing..."
+        sudo ip rule add from $LOCAL_NET to $LOCAL_NET table main priority 90 2>/dev/null || echo "Local network routing rule already exists"
+        sudo ip rule add to $LOCAL_NET table main priority 40 2>/dev/null || echo "Local network return routing rule already exists"
+    fi
+fi
+
+# Let Tailscale handle its own routing when using exit nodes
+echo "✅ Letting Tailscale manage exit node routing automatically"
+
+# Check if exit node is actually active (may not be if connection failed)
+echo ""
+echo "Verifying exit node connection..."
+if sudo tailscale status 2>/dev/null | grep -q "$TAILSCALE_EXIT_NODE_NAME.*active.*exit node"; then
+    echo "   ✅ Exit node is active and connected!"
+else
+    echo "   ⚠️  Exit node is not yet active (this is normal if network is still connecting)"
+    echo "   💡 The exit node will connect automatically when network is available"
+    echo "   💡 You can check status later with: sudo tailscale status"
+fi
+
+# Verify DNS is properly configured
+echo ""
+echo "Verifying DNS configuration..."
+
+# Remove immutable flag if still set from earlier package-update protection
+if lsattr /etc/resolv.conf 2>/dev/null | grep -q "i"; then
+    echo "   Removing immutable flag from /etc/resolv.conf..."
+    sudo chattr -i /etc/resolv.conf 2>/dev/null || true
+fi
+
+# Give Tailscale a moment to update resolv.conf
+sleep 3
+
+# Check if Tailscale is managing DNS; if not, force it
+if grep -q "100.100.100.100" /etc/resolv.conf 2>/dev/null; then
+    echo "✅ Tailscale DNS is active"
+else
+    echo "   Tailscale DNS not detected in resolv.conf - forcing Tailscale DNS..."
+    
+    # Tailscale on Linux without systemd-resolved often cannot write resolv.conf
+    # on its own. Write it directly to prevent DNS leaks.
+    # ONLY Tailscale DNS -- no public fallback to prevent DNS leaks.
+    sudo chattr -i /etc/resolv.conf 2>/dev/null || true
+    sudo rm -f /etc/resolv.conf
+    echo "nameserver 100.100.100.100" | sudo tee /etc/resolv.conf > /dev/null
+    
+    # Verify the write worked
+    if grep -q "100.100.100.100" /etc/resolv.conf 2>/dev/null; then
+        echo "✅ Tailscale DNS forced into resolv.conf"
+    else
+        echo "❌ Failed to write Tailscale DNS to resolv.conf"
+    fi
+    
+    # Verify DNS actually resolves through Tailscale
+    sleep 1
+    if ping -c 1 -W 3 google.com >/dev/null 2>&1; then
+        echo "✅ DNS resolution working through Tailscale"
+    else
+        echo "⚠️  DNS resolution not working yet (Tailscale DNS may need a moment)"
+    fi
+fi
+
+echo "✅ Tailscale routing configured"
 
 # --- System Health Checks ---
 echo ""
