@@ -247,6 +247,11 @@ write_clean_nm_conf() {
     sudo bash -c "cat > '$nm_conf'" << NMEOF
 [main]
 plugins=ifupdown,keyfile
+# CRITICAL: dns=none stops NetworkManager rewriting /etc/resolv.conf with the DHCP
+# nameservers handed out by the local network. Without it, NM clobbers Tailscale DNS
+# on every connect and lease renewal, causing a silent DNS leak (exit IP still looks
+# correct, but lookups go to the local ISP).
+dns=none
 
 [ifupdown]
 managed=false
@@ -1236,6 +1241,8 @@ sudo systemctl disable systemd-resolved 2>/dev/null || true
 # ONLY Tailscale DNS is used -- no public fallback to prevent DNS leaks.
 sudo rm -f /etc/resolv.conf
 echo "nameserver 100.100.100.100" | sudo tee /etc/resolv.conf > /dev/null
+# Lock the file so NetworkManager/dhcpcd cannot overwrite it with local DHCP DNS.
+sudo chattr +i /etc/resolv.conf 2>/dev/null || true
 
 echo "=== Stop services while we configure ==="
 sudo systemctl stop hostapd || true
@@ -1572,6 +1579,11 @@ interface=$USB_WIFI
 dhcp-range=$DHCP_START,$DHCP_END,${DHCP_LEASE_TIME:-12h}
 dhcp-option=3,$AP_GATEWAY
 dhcp-option=6,$AP_GATEWAY
+# CRITICAL: no-resolv stops dnsmasq merging /etc/resolv.conf nameservers into its
+# upstream pool. Without it, "server=" is additive, not exclusive -- if anything
+# (NetworkManager, dhcpcd) writes the local network's DNS into resolv.conf, client
+# queries leak to the local ISP even though the exit node is working.
+no-resolv
 server=${TAILSCALE_DNS:-100.100.100.100}
 log-queries
 log-dhcp
@@ -2095,6 +2107,9 @@ else
     sudo rm -f /etc/resolv.conf
     echo "nameserver 100.100.100.100" | sudo tee /etc/resolv.conf > /dev/null
     
+    # Lock the file so NetworkManager/dhcpcd cannot overwrite it with local DHCP DNS.
+    sudo chattr +i /etc/resolv.conf 2>/dev/null || true
+
     # Verify the write worked
     if grep -q "100.100.100.100" /etc/resolv.conf 2>/dev/null; then
         echo "✅ Tailscale DNS forced into resolv.conf"

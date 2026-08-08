@@ -10,7 +10,8 @@ All your devices automatically think they are at your home location.  No need to
 individually to proxy.  
 Anyone monitoring your device at the OS level has no way to know your actual location.
 Any hackers at the local coffee shop wifi cannot read your traffic.
-DNS Leaks are prevented by using tailscale DNS.
+DNS Leaks are prevented by using tailscale DNS (verify this yourself after setup -
+see "Verifying there is no DNS leak" below).
 Monitors can't tell you are using a vpn, because you are using your own home connection to reach
 the internet.
 
@@ -28,6 +29,37 @@ On your travel router:
 
 If you need to connect the travel router to a new hotel's wifi, run `nmtui` to enter the
 new hotel wifi and password.
+
+Plug the USB wifi adapter into a BLACK (USB 2.0) port, not a blue (USB 3.0) one:
+  USB 3.0 signalling radiates broadband interference right across the 2.4GHz band, and
+  the raspberrypi's onboard antenna sits inches away.  This does not look like
+  interference when you debug it - it looks like a weak or congested hotel wifi: low
+  negotiated bitrate, poor RSSI, erratic latency on large packets, and throughput that
+  collapses under sustained load.  Measured on a Pi 5: 2 Mbps through the tunnel with the
+  adapter on USB 3.0, 12 Mbps after moving it (and a phone charger) to the black ports.
+  USB 2.0 gives ~300 Mbps, far more than any hotel connection, so there is no speed cost.
+  If you need USB 3.0 for something else, use a shielded extension cable to get the
+  device away from the antenna.
+
+Traveling outside your home country:
+  Set REGULATORY_COUNTRY in tunnel.conf to where you actually are.  It is applied
+  globally, so a wrong value also restricts the onboard adapter that connects to the
+  hotel - for example a US setting cannot use 2.4GHz channels 12-13, which are legal and
+  commonly used in Europe.  Change AP_CHANNEL to a channel that is legal in that country
+  at the same time (36-48 are safe about everywhere), otherwise hostapd will refuse to
+  start and the watchdog will restart it in a loop.
+
+Verifying there is no DNS leak:
+  Connect a device to the tunnel and visit a DNS leak test site.  Every resolver listed
+  should be reachable from your exit node's location.  If you see a resolver belonging to
+  the local ISP where you are physically sitting, DNS is leaking - your public IP can
+  look completely correct while this is happening, so check it explicitly.
+  On the travel router, these should all hold:
+    cat /etc/resolv.conf        # only "nameserver 100.100.100.100"
+    lsattr /etc/resolv.conf     # the "i" (immutable) flag is set
+    grep no-resolv /etc/dnsmasq.conf
+  `no-resolv` matters because dnsmasq's `server=` line is additive, not exclusive -
+  without it dnsmasq also forwards to whatever is in /etc/resolv.conf.
 
 ```
 ✅ Letting Tailscale manage exit node routing automatically
