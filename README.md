@@ -61,6 +61,60 @@ Verifying there is no DNS leak:
   `no-resolv` matters because dnsmasq's `server=` line is additive, not exclusive -
   without it dnsmasq also forwards to whatever is in /etc/resolv.conf.
 
+Ethernet sharing:
+  Set ETH_ENABLE="true" in tunnel.conf to also share the tunnel over the Pi's ethernet
+  port. Plug a laptop into it and it gets a DHCP lease automatically, on its own subnet
+  (ETH_IP_RANGE, separate from the access point's AP_IP_RANGE) tunneled through the exit
+  node the same way Wi-Fi clients are.
+  The ethernet gateway (ETH_GATEWAY, e.g. 10.0.60.1) is always reachable from a plugged-in
+  laptop, even with no hotel Wi-Fi configured yet - `ssh pi@10.0.60.1` works before the
+  Pi has any upstream internet at all. Use the IP, not the hostname: mDNS/hostname
+  resolution may not be up yet. This is the easiest way to do headless setup: ssh in over
+  the cable and run `sudo nmtui` to join the hotel Wi-Fi, or use TigerVNC over the cable
+  to click through a captive portal.
+  Ethernet-to-hotel-Wi-Fi forwarding is deliberately blocked, so if the tunnel is down,
+  ethernet client traffic fails closed instead of leaking out the hotel connection.
+  Turn off (or deprioritize) the laptop's own Wi-Fi once it's plugged in, otherwise it may
+  keep routing over Wi-Fi instead of the cable.
+  Verify the same way as a Wi-Fi client: `curl ifconfig.me` should match
+  TAILSCALE_EXPECTED_IP, and you still need to run the DNS leak test above - a correct
+  exit IP by itself proves nothing about DNS.
+
+Broken hotel gateway autofix:
+  Some hotel routers hand out a DHCP gateway that simply doesn't work - e.g. a
+  transposed-digit typo like 172.10.20.1 on a 172.20.10.0/23 network, instead of
+  the real gateway 172.20.10.1. The Pi gets a normal-looking DHCP lease and IP
+  address, but has 100% packet loss, because nothing on the LAN answers ARP for
+  that address (`ip neigh` shows it stuck INCOMPLETE). Rebooting or re-running
+  tunnel.sh can never fix this by itself, since every DHCP lease re-delivers the
+  same bad gateway.
+  tunnel.sh detects this (ARP INCOMPLETE/FAILED, not just "ping fails" - many
+  real gateways silently drop ICMP to themselves while still forwarding fine)
+  and tries likely-correct candidate gateways - the interface's own subnet .1
+  address and the DHCP server identifier, if available - until one restores
+  internet. The installed watchdog re-applies the same fix on every check,
+  since DHCP renewals keep re-installing the bad gateway.
+  This is controlled by GATEWAY_AUTOFIX in tunnel.conf (default "true"). The fix
+  is route-only and deliberately non-persistent, so nothing stale outlives the
+  network - it prints the exact `sudo nmcli connection modify ... ipv4.gateway
+  <ip>` command if you want to pin it yourself for the rest of your stay.
+
+ICMP-hostile networks and Wi-Fi power save:
+  At one hotel, the AP used a 300ms beacon interval, and the Pi's hotel-facing
+  radio had Wi-Fi power save enabled. That combination pushed ping RTTs to the
+  Pi's own gateway lookups to ~8 seconds with 66-100% loss, even though TCP
+  connections worked fine the whole time - the radio was dozing between beacons
+  and buffering frames (including ICMP replies) for seconds. Since every
+  connectivity gate in tunnel.sh was a single `ping -c 1 8.8.8.8`, the script
+  false-failed with "NO INTERNET" on a network that actually worked fine.
+  tunnel.sh now checks connectivity with `check_internet()`, which falls back to
+  a raw TCP connect (port 53 and 443 on public DNS resolvers) when ping fails or
+  times out, so a slow/lossy-but-working ICMP path no longer aborts setup. It
+  also disables power save on the hotel Wi-Fi interface as soon as the internet
+  check succeeds (`iw dev ... set power_save off`, persisted best-effort via
+  `nmcli ... 802-11-wireless.powersave 2`), and the watchdog re-asserts this
+  every loop since NetworkManager can silently re-enable it on reconnect.
+
 ```
 ✅ Letting Tailscale manage exit node routing automatically
 ✅ Tailscale routing configured

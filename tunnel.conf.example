@@ -36,13 +36,14 @@ AP_PASSWORD="SecurePassword123"
 AP_CHANNEL="6"
 
 # WiFi hardware mode (frequency band)
-# Options: 
-#   g (2.4GHz 802.11g - most compatible)
-#   a (5GHz 802.11a - for WiFi 6 adapters like Netgear A8000)
-#   n (2.4GHz 802.11n)
-#   ac (5GHz 802.11ac)
+# Options:
+#   g (2.4GHz - most compatible)
+#   a or ac (5GHz - for adapters like the Netgear A8000; both are equivalent)
+#   n (same as g)
+# 802.11n is always enabled on top of the base mode, and 5GHz modes also get
+# 802.11ac/ax with an 80 MHz channel when the chosen AP_CHANNEL allows it
+# (36-48 and 149-161 do; 165 is 20 MHz only).
 # Note: Your USB WiFi adapter must support the selected mode
-# For WiFi 6 (802.11ax) adapters, use "a" mode with 5GHz channels
 AP_HW_MODE="g"
 
 # Regulatory country code for WiFi channels
@@ -71,6 +72,36 @@ DHCP_END="10.0.50.100"
 DHCP_LEASE_TIME="12h"
 
 # =============================================================================
+# ETHERNET SHARING CONFIGURATION
+# =============================================================================
+
+# Enable sharing the tunnel over the Pi's ethernet port (true/false)
+# Opt-in: when enabled, a laptop plugged into the ethernet port gets its own
+# DHCP lease on a separate subnet from the access point, and its traffic is
+# forced through the tunnel exit node, same as WiFi AP clients.
+# Ethernet clients can always reach the Pi itself at ETH_GATEWAY, even before
+# the hotel WiFi is configured -- handy for headless setup over ssh (e.g.
+# `sudo nmtui`) or TigerVNC for captive portals. Ethernet-to-hotel-WiFi
+# forwarding is deliberately blocked, so traffic fails closed if the tunnel
+# is down.
+ETH_ENABLE="false"
+
+# Ethernet interface name
+# Leave empty to auto-detect (eth0 or end0)
+ETH_INTERFACE=""
+
+# IP address range for ethernet clients (must differ from AP_IP_RANGE)
+# Format: first three octets (e.g., "10.0.60" creates 10.0.60.x network)
+ETH_IP_RANGE="10.0.60"
+
+# Gateway IP (usually .1 of your range)
+ETH_GATEWAY="10.0.60.1"
+
+# DHCP range for the ethernet client
+ETH_DHCP_START="10.0.60.10"
+ETH_DHCP_END="10.0.60.50"
+
+# =============================================================================
 # DNS CONFIGURATION
 # =============================================================================
 
@@ -81,6 +112,36 @@ FALLBACK_DNS_SECONDARY="1.1.1.1"
 # =============================================================================
 # ADVANCED CONFIGURATION
 # =============================================================================
+
+# Reverse which radio does which job (true/false)
+# Leave unset or "false" to keep the default:
+#   onboard adapter  -> connects to the hotel Wi-Fi
+#   USB adapter      -> creates the access point for your devices
+# Set to "true" to reverse them, so the USB adapter connects to the hotel and the
+# onboard radio serves the access point.
+# Worth doing when your USB adapter has the better antenna: the hotel link is the one
+# fighting distance and walls, while the access point only has to reach devices in the
+# same room.  Check `iw dev <iface> link` for signal strength before and after.
+# Requires two Wi-Fi interfaces, and whichever adapter ends up serving the access point
+# must support AP mode (the Raspberry Pi onboard radio does).
+SWAP_WIFI_ROLES="false"
+
+# Automatically detect and repair a broken DHCP-advertised default gateway
+# (true/false). Real-world case this exists for: a hotel's DHCP pool served
+# gateway 172.10.20.1 to clients on subnet 172.20.10.0/23 - a transposed-digit
+# typo of the real gateway, 172.20.10.1. The Pi got a normal-looking DHCP
+# lease but had 100% packet loss, because nothing on the LAN answers ARP for
+# the bogus address. Rebooting or re-running this script cannot fix that on
+# its own: every lease re-delivers the same bad gateway option. When enabled,
+# tunnel.sh (and the watchdog it installs) detect this by checking that the
+# gateway's ARP entry is stuck INCOMPLETE/FAILED (not just "ping fails" -
+# plenty of real gateways drop ICMP to themselves while forwarding fine), then
+# try likely-correct candidate gateways (the interface's own subnet .1
+# address, and the DHCP server identifier if available) until one restores
+# internet. The fix is route-only and non-persistent by design - it prints the
+# `nmcli connection modify ... ipv4.gateway <ip>` command to pin it yourself
+# if you want it to survive reboots for the rest of your stay.
+GATEWAY_AUTOFIX="true"
 
 # Enable debug output (true/false)
 DEBUG_MODE="false"

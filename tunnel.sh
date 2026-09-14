@@ -90,6 +90,32 @@ configure_wifi_regulatory_domain() {
         echo "   ⚠️  iw is not installed yet; persistent regulatory domain will still be configured"
     fi
 
+    # wpa_supplicant re-applies its own country= every time it starts, which runs
+    # after this script and silently overrides "iw reg set". The Raspberry Pi
+    # Imager writes the locale chosen at flash time (e.g. FR) into
+    # wpa_supplicant.conf, so pin it to the configured country here.
+    local wpa_conf="/etc/wpa_supplicant/wpa_supplicant.conf"
+    if command -v raspi-config >/dev/null 2>&1; then
+        sudo raspi-config nonint do_wifi_country "$reg_country" >/dev/null 2>&1 || true
+        echo "   ✅ Wi-Fi country set via raspi-config"
+    fi
+    if [ -f "$wpa_conf" ]; then
+        if sudo grep -q '^[[:space:]]*country=' "$wpa_conf"; then
+            sudo sed -i -E "s/^[[:space:]]*country=.*/country=$reg_country/" "$wpa_conf"
+        else
+            echo "country=$reg_country" | sudo tee -a "$wpa_conf" >/dev/null
+        fi
+        echo "   ✅ country=$reg_country pinned in $wpa_conf"
+    fi
+    # Tell any already-running wpa_supplicant instances (including the one
+    # NetworkManager spawns) about the new country without waiting for a restart.
+    if command -v wpa_cli >/dev/null 2>&1; then
+        for sock in /var/run/wpa_supplicant/*; do
+            [ -e "$sock" ] || continue
+            sudo wpa_cli -i "$(basename "$sock")" set country "$reg_country" >/dev/null 2>&1 || true
+        done
+    fi
+
     # Make the setting survive reboots so scans include the correct country channels.
     if [ -d "/etc/modprobe.d" ]; then
         if [ -f "$cfg_file" ] && sudo grep -Eq '^[[:space:]]*options[[:space:]]+cfg80211.*ieee80211_regdom=' "$cfg_file"; then
@@ -219,30 +245,153 @@ else
     AP_WIFI="$DETECTED_USB"
 fi
 
-# For backward compatibility with rest of script
+# =============================================================================
+# OPTIONAL ROLE SWAP
+# =============================================================================
+# Default (SWAP_WIFI_ROLES unset or false): onboard adapter connects to the hotel,
+# USB adapter serves the access point. Setting SWAP_WIFI_ROLES="true" reverses that,
+# so the USB adapter (usually the better antenna) handles the long-haul hotel link
+# and the onboard radio serves devices in the same room.
+SWAP_WIFI_ROLES_NORMALIZED=$(echo "${SWAP_WIFI_ROLES:-false}" | tr '[:upper:]' '[:lower:]')
+if [ "$SWAP_WIFI_ROLES_NORMALIZED" = "true" ] || [ "$SWAP_WIFI_ROLES_NORMALIZED" = "yes" ] || [ "$SWAP_WIFI_ROLES_NORMALIZED" = "1" ]; then
+    if [ "$HOTEL_WIFI" = "$AP_WIFI" ]; then
+        echo "⚠️  SWAP_WIFI_ROLES is set but only one Wi-Fi interface was found - ignoring swap"
+    else
+        SWAPPED_HOTEL="$AP_WIFI"
+        AP_WIFI="$HOTEL_WIFI"
+        HOTEL_WIFI="$SWAPPED_HOTEL"
+        ROLES_SWAPPED=true
+        echo ""
+        echo "🔄 SWAP_WIFI_ROLES enabled - reversing the default radio roles"
+    fi
+fi
+
+# For backward compatibility with rest of script.
+# NOTE: these names describe the DEFAULT hardware layout. When SWAP_WIFI_ROLES is on,
+# ONBOARD_WIFI actually refers to the USB adapter and USB_WIFI to the onboard radio.
+# Everything downstream uses them by ROLE (hotel client vs access point), not hardware.
 ONBOARD_WIFI="$HOTEL_WIFI"
 USB_WIFI="$AP_WIFI"
 
 echo ""
 echo "Role Assignment:"
-echo "  - Onboard Wi-Fi ($HOTEL_WIFI): Will connect to hotel Wi-Fi"
-echo "  - USB Wi-Fi ($AP_WIFI): Will create access point for your devices (better range)"
+if [ "${ROLES_SWAPPED:-false}" = "true" ]; then
+    echo "  - USB Wi-Fi ($HOTEL_WIFI): Will connect to hotel Wi-Fi (swapped)"
+    echo "  - Onboard Wi-Fi ($AP_WIFI): Will create access point for your devices (swapped)"
+else
+    echo "  - Onboard Wi-Fi ($HOTEL_WIFI): Will connect to hotel Wi-Fi"
+    echo "  - USB Wi-Fi ($AP_WIFI): Will create access point for your devices (better range)"
+fi
 echo ""
+
+# =============================================================================
+# OPTIONAL ETHERNET INTERNET SHARING
+# =============================================================================
+# Default (ETH_ENABLE unset or false): no wired interface is touched and behavior
+# is 100% unchanged. Setting ETH_ENABLE="true" shares the Tailscale tunnel with a
+# laptop plugged into the Pi's ethernet port, exactly parallel to how AP_WIFI
+# serves Wi-Fi clients.
+ETH_ENABLE_NORMALIZED=$(echo "${ETH_ENABLE:-false}" | tr '[:upper:]' '[:lower:]')
+if [ "$ETH_ENABLE_NORMALIZED" = "true" ] || [ "$ETH_ENABLE_NORMALIZED" = "yes" ] || [ "$ETH_ENABLE_NORMALIZED" = "1" ]; then
+    ETH_ENABLED=true
+else
+    ETH_ENABLED=false
+fi
+
+ETH_IP_RANGE="${ETH_IP_RANGE:-10.0.60}"
+ETH_GATEWAY="${ETH_GATEWAY:-10.0.60.1}"
+ETH_DHCP_START="${ETH_DHCP_START:-10.0.60.10}"
+ETH_DHCP_END="${ETH_DHCP_END:-10.0.60.50}"
+
+if [ "$ETH_ENABLED" = true ]; then
+    echo "=== Detecting ethernet interface for internet sharing ==="
+    if [ -n "$ETH_INTERFACE" ]; then
+        echo "Using configured ETH_INTERFACE: $ETH_INTERFACE"
+    else
+        DETECTED_ETH=""
+        # Prefer eth0, then end0 (common Raspberry Pi wired NIC names)
+        for candidate in eth0 end0; do
+            if [ -d "/sys/class/net/$candidate" ]; then
+                DETECTED_ETH="$candidate"
+                break
+            fi
+        done
+        # Fall back to any other wired-looking interface (en*), excluding wlan*
+        if [ -z "$DETECTED_ETH" ]; then
+            for iface_path in /sys/class/net/en*; do
+                [ -d "$iface_path" ] || continue
+                candidate=$(basename "$iface_path")
+                case "$candidate" in
+                    wlan*) continue ;;
+                esac
+                DETECTED_ETH="$candidate"
+                break
+            done
+        fi
+        ETH_INTERFACE="$DETECTED_ETH"
+        if [ -n "$ETH_INTERFACE" ]; then
+            echo "✅ Detected ethernet interface: $ETH_INTERFACE"
+        fi
+    fi
+
+    if [ -z "$ETH_INTERFACE" ]; then
+        echo "⚠️  ETH_ENABLE is true but no wired ethernet interface was found - disabling ethernet sharing for this run"
+        ETH_ENABLED=false
+    else
+        echo "Ethernet sharing network: ${ETH_IP_RANGE}.0/24 (gateway $ETH_GATEWAY)"
+    fi
+    echo ""
+fi
+
+# =============================================================================
+# OPTIONAL GATEWAY AUTOFIX
+# =============================================================================
+# Default (GATEWAY_AUTOFIX unset or true): detect and repair a broken
+# DHCP-advertised default gateway (see attempt_gateway_autofix below for the
+# hotel-typo scenario this covers). Set to "false" to disable auto-repair and
+# only ever use whatever gateway DHCP hands out.
+GATEWAY_AUTOFIX_NORMALIZED=$(echo "${GATEWAY_AUTOFIX:-true}" | tr '[:upper:]' '[:lower:]')
+if [ "$GATEWAY_AUTOFIX_NORMALIZED" = "true" ] || [ "$GATEWAY_AUTOFIX_NORMALIZED" = "yes" ] || [ "$GATEWAY_AUTOFIX_NORMALIZED" = "1" ]; then
+    GATEWAY_AUTOFIX="true"
+else
+    GATEWAY_AUTOFIX="false"
+fi
+
+# Compute the NetworkManager [keyfile] unmanaged-devices value for the AP interface,
+# appending the ethernet interface when ETH_ENABLE is active so NetworkManager never
+# tries to manage it either (hostapd/dnsmasq/static-IP handle it directly, like the AP).
+nm_unmanaged_devices_value() {
+    local ap_iface="$1"
+    if [ "${ETH_ENABLED:-false}" = true ] && [ -n "${ETH_INTERFACE:-}" ]; then
+        printf 'interface-name:%s;interface-name:%s' "$ap_iface" "$ETH_INTERFACE"
+    else
+        printf 'interface-name:%s' "$ap_iface"
+    fi
+}
 
 # =============================================================================
 # CRITICAL: CONFIGURE NetworkManager
 # - HOTEL_WIFI (onboard, $HOTEL_WIFI): Must be MANAGED for hotel connection
 # - AP_WIFI (USB adapter, $AP_WIFI): Must be UNMANAGED for hostapd access point
+# - ETH_INTERFACE (optional, $ETH_INTERFACE): Must be UNMANAGED when ETH_ENABLE=true
 # =============================================================================
 
 # Write a clean NetworkManager.conf from scratch (idempotent, no appending)
 write_clean_nm_conf() {
     local hotel_iface="${1:-$HOTEL_WIFI}"
     local ap_iface="${2:-$AP_WIFI}"
+    local eth_iface="${3:-$ETH_INTERFACE}"
     local nm_conf="/etc/NetworkManager/NetworkManager.conf"
 
     hotel_iface="${hotel_iface:-wlan0}"
     ap_iface="${ap_iface:-wlan1}"
+
+    local eth_device_block=""
+    if [ "${ETH_ENABLED:-false}" = true ] && [ -n "$eth_iface" ]; then
+        eth_device_block=$(printf '\n[device-eth]\nmatch-device=interface-name:%s\nmanaged=0\n' "$eth_iface")
+    fi
+    local unmanaged_value
+    unmanaged_value=$(nm_unmanaged_devices_value "$ap_iface")
 
     sudo bash -c "cat > '$nm_conf'" << NMEOF
 [main]
@@ -266,9 +415,9 @@ managed=1
 [device-ap-wifi]
 match-device=interface-name:${ap_iface}
 managed=0
-
+${eth_device_block}
 [keyfile]
-unmanaged-devices=interface-name:${ap_iface}
+unmanaged-devices=${unmanaged_value}
 NMEOF
 
     local kf_count
@@ -279,6 +428,213 @@ NMEOF
     fi
     return 0
 }
+
+# =============================================================================
+# CONNECTIVITY CHECK (ICMP-hostile / high-latency network survival)
+# =============================================================================
+# Real-world case this exists for: a hotel AP with a 300ms beacon interval,
+# combined with Wi-Fi power save enabled on the Pi's hotel-facing radio, pushed
+# ICMP RTTs to ~8 seconds with 66-100% ping loss -- while TCP connects succeeded
+# fine the whole time. Every connectivity gate in this script was `ping -c 1
+# -W 2 8.8.8.8`, so the script false-failed with "NO INTERNET" on a network
+# that actually worked. Some hotel gateways also rate-limit/drop ICMP outright.
+# Ping alone therefore can't be trusted as the sole signal; fall back to raw
+# TCP reachability before declaring the network dead.
+check_internet() {
+    ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && return 0
+    timeout 3 bash -c '>/dev/tcp/8.8.8.8/53' 2>/dev/null && return 0
+    timeout 3 bash -c '>/dev/tcp/1.1.1.1/443' 2>/dev/null && return 0
+    return 1
+}
+
+# =============================================================================
+# HOTEL DHCP GATEWAY AUTOFIX
+# =============================================================================
+# Real-world case this exists for: a hotel's DHCP pool handed out gateway
+# 172.10.20.1 to clients on subnet 172.20.10.0/23 -- a transposed-digit typo
+# of the real gateway, 172.20.10.1. The Pi associated fine and got a normal
+# DHCP lease, but had 100% packet loss: `ip neigh` showed the gateway stuck
+# INCOMPLETE (ARP never answers, because nothing on the LAN owns that
+# address). Rebooting or re-running this script can never fix it alone --
+# every lease re-delivers the same bad gateway option, and DHCP renewals keep
+# hitting the same misconfigured server.
+#
+# Detection: ping to the internet fails AND the default gateway's ARP entry
+# is INCOMPLETE/FAILED (or missing an lladdr entirely), OR the advertised
+# gateway address falls outside the interface's own subnet. A gateway merely
+# failing to answer ping is NOT a signal by itself -- many gateways silently
+# drop ICMP addressed to themselves while still forwarding traffic fine; ARP
+# state is the trustworthy check.
+#
+# $1: interface to repair (the hotel Wi-Fi interface)
+# Returns 0 and leaves a working default route in place on success.
+# Returns 1 (no-op) if GATEWAY_AUTOFIX is disabled, there's nothing to fix, or
+# no candidate gateway restores connectivity (original route is restored).
+attempt_gateway_autofix() {
+    local iface="$1"
+
+    if [ "${GATEWAY_AUTOFIX:-true}" != "true" ]; then
+        return 1
+    fi
+
+    local gw
+    gw=$(ip route show default dev "$iface" 2>/dev/null | awk '{print $3}' | head -1)
+    if [ -z "$gw" ]; then
+        return 1
+    fi
+
+    # Compute the interface's own subnet (network address) in pure bash -- avoids
+    # depending on ipcalc, which is not guaranteed to be installed on Raspberry Pi OS.
+    local cidr ip_part prefix
+    cidr=$(ip -o -f inet addr show "$iface" 2>/dev/null | awk '{print $4}' | head -1)
+    if [ -z "$cidr" ]; then
+        return 1
+    fi
+    ip_part="${cidr%/*}"
+    prefix="${cidr#*/}"
+
+    local a b c d ip_int mask net_int cand_int candidate_dotone
+    IFS='.' read -r a b c d <<< "$ip_part"
+    ip_int=$(( (a<<24) + (b<<16) + (c<<8) + d ))
+    if [ "$prefix" -eq 0 ] 2>/dev/null; then
+        mask=0
+    else
+        mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    fi
+    net_int=$(( ip_int & mask ))
+    # NOTE: this is network-address-plus-one from the REAL prefix, not a naive
+    # first-three-octets-plus-.1 -- for a /23 like the hotel above,
+    # 172.20.11.78/23 has network 172.20.10.0, so the candidate is 172.20.10.1,
+    # not 172.20.11.1.
+    cand_int=$(( net_int + 1 ))
+    candidate_dotone=$(printf '%d.%d.%d.%d' $(( (cand_int>>24)&255 )) $(( (cand_int>>16)&255 )) $(( (cand_int>>8)&255 )) $(( cand_int&255 )))
+
+    # Is the current gateway outside our own subnet?
+    local gw_a gw_b gw_c gw_d gw_int gw_outside_subnet=false
+    IFS='.' read -r gw_a gw_b gw_c gw_d <<< "$gw"
+    gw_int=$(( (gw_a<<24) + (gw_b<<16) + (gw_c<<8) + gw_d ))
+    if [ $(( gw_int & mask )) -ne "$net_int" ]; then
+        gw_outside_subnet=true
+    fi
+
+    # Trigger ARP resolution, then inspect the neighbor table entry.
+    ping -c 1 -W 1 "$gw" >/dev/null 2>&1 || true
+    local neigh_line neigh_bad=false
+    neigh_line=$(ip neigh show "$gw" dev "$iface" 2>/dev/null)
+    if [ -z "$neigh_line" ]; then
+        neigh_bad=true
+    elif echo "$neigh_line" | grep -qiE 'INCOMPLETE|FAILED'; then
+        neigh_bad=true
+    elif ! echo "$neigh_line" | grep -q 'lladdr'; then
+        neigh_bad=true
+    fi
+
+    if [ "$neigh_bad" != true ] && [ "$gw_outside_subnet" != true ]; then
+        return 1
+    fi
+
+    echo ""
+    echo "⚠️  Default gateway $gw looks broken (ARP: ${neigh_line:-no entry}; outside own subnet: $gw_outside_subnet)"
+    echo "🔧 Attempting gateway autofix..."
+
+    # Build a deduped candidate list, excluding the known-bad gateway.
+    local candidates=()
+    if [ "$candidate_dotone" != "$gw" ]; then
+        candidates+=("$candidate_dotone")
+    fi
+
+    # Best-effort: mine the DHCP options NetworkManager saw for more candidates.
+    # NOTE: `nmcli -g DHCP4.OPTION` joins every option into ONE line separated by
+    # " | ", so split on '|' before matching -- a naive grep/sed here once produced
+    # a garbage "candidate" containing the entire option dump.
+    # The `routers` option is the highest-quality source: per RFC 3442, clients
+    # must prefer classless-static-routes (option 121) over `routers` when both
+    # are present, so a DHCP server can advertise a broken 121 default route while
+    # `routers` still carries the correct gateway. Seen in the wild: routers =
+    # 172.20.10.1 (right) alongside rfc3442 0.0.0.0/0 via 172.10.20.1 (typo).
+    local active_conn dhcp_opts opt_pattern opt_candidate
+    active_conn=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep ":$iface\$" | cut -d: -f1 | head -1) || true
+    if [ -n "$active_conn" ]; then
+        dhcp_opts=$(nmcli -g DHCP4.OPTION connection show "$active_conn" 2>/dev/null | tr '|' '\n') || true
+        for opt_pattern in 'routers =' 'dhcp_server_identifier ='; do
+            opt_candidate=$(echo "$dhcp_opts" | grep -F "$opt_pattern" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1) || true
+            if echo "$opt_candidate" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && [ "$opt_candidate" != "$gw" ]; then
+                local already_listed=false
+                for c in "${candidates[@]}"; do
+                    [ "$c" = "$opt_candidate" ] && already_listed=true
+                done
+                [ "$already_listed" = true ] || candidates+=("$opt_candidate")
+            fi
+        done
+    fi
+
+    if [ ${#candidates[@]} -eq 0 ]; then
+        echo "❌ Gateway autofix: no alternative candidate gateway found"
+        return 1
+    fi
+
+    local cand ping_out
+    for cand in "${candidates[@]}"; do
+        echo "   Trying candidate gateway $cand..."
+        if sudo ip route replace default via "$cand" dev "$iface" 2>/dev/null; then
+            ping_out=$(ping -c 2 -W 2 8.8.8.8 2>&1) || true
+            tcp_ok=false
+            if timeout 3 bash -c '>/dev/tcp/8.8.8.8/53' 2>/dev/null || timeout 3 bash -c '>/dev/tcp/1.1.1.1/443' 2>/dev/null; then
+                tcp_ok=true
+            fi
+            if echo "$ping_out" | grep -qE ", [1-9][0-9]* received" || [ "$tcp_ok" = true ]; then
+                if ! echo "$ping_out" | grep -qE ", [1-9][0-9]* received"; then
+                    echo "   (ICMP lossy but TCP works - accepting candidate)"
+                fi
+                echo ""
+                echo "🔧 ================================================================"
+                echo "🔧 HOTEL DHCP GATEWAY AUTOFIX SUCCEEDED"
+                echo "🔧 ================================================================"
+                echo "   The hotel's DHCP server advertised a broken gateway ($gw) whose"
+                echo "   ARP entry never resolves. Routing through $cand instead restored"
+                echo "   internet. This is almost always a typo in the hotel's DHCP"
+                echo "   configuration (e.g. serving 172.10.20.1 instead of 172.20.10.1)."
+                echo ""
+                echo "   To pin this gateway for the rest of your stay on this network:"
+                echo "     sudo nmcli connection modify \"$active_conn\" ipv4.gateway $cand"
+                echo "   To remove the pin when you check out (so it doesn't affect the"
+                echo "   next network you connect to):"
+                echo "     sudo nmcli connection modify \"$active_conn\" ipv4.gateway \"\""
+                echo ""
+                echo "   If the DHCP options show the bad gateway coming from"
+                echo "   rfc3442_classless_static_routes (option 121) while 'routers ='"
+                echo "   holds the correct one, you can instead make this profile ignore"
+                echo "   DHCP-provided routes entirely (also clear at checkout):"
+                echo "     sudo nmcli connection modify \"$active_conn\" ipv4.ignore-auto-routes yes"
+                echo "🔧 ================================================================"
+                echo ""
+                return 0
+            else
+                echo "   ❌ Candidate $cand did not restore connectivity:"
+                echo "$ping_out" | tail -3 | sed 's/^/      /'
+                echo "      route now: $(ip route show default dev "$iface" 2>/dev/null | head -1)"
+                echo "      arp:       $(ip neigh show "$cand" dev "$iface" 2>/dev/null || true)"
+            fi
+        fi
+    done
+
+    # No candidate worked -- restore the original default route exactly as it was.
+    sudo ip route replace default via "$gw" dev "$iface" 2>/dev/null || true
+    echo "❌ Gateway autofix failed - no candidate gateway restored connectivity"
+    return 1
+}
+
+# Stop the watchdog and AP services before touching interface roles.
+# The watchdog runs with the role assignment baked in from the LAST successful run, and
+# every loop it forces the previous AP interface back to unmanaged. If the roles have
+# since changed (SWAP_WIFI_ROLES), it steals the radio we now want to use as the hotel
+# client -- surfacing as "Device disconnected by user or client" -- and because this
+# script exits early when there is no internet, it never reaches the code further down
+# that would regenerate the watchdog with the new roles. That is a deadlock: stop it here.
+echo "=== Stopping watchdog and AP services before reconfiguring ==="
+sudo systemctl stop tunnel-watchdog 2>/dev/null || true
+sudo systemctl stop hostapd 2>/dev/null || true
+sudo systemctl stop dnsmasq 2>/dev/null || true
 
 echo "=== Pre-flight check: Configuring Wi-Fi interface management ==="
 
@@ -316,11 +672,23 @@ else
     if [ "$DEVICE_HOTEL_COUNT" -ne 1 ]; then
         NM_NEEDS_REWRITE=true
     fi
+    # A conf left over from a different role assignment is structurally valid but has
+    # the roles backwards, which leaves the hotel interface unmanaged. The
+    # unmanaged-devices line uniquely identifies which interface is the access point
+    # (and, when ETH_ENABLE is active, the ethernet interface too), so compare it
+    # against the roles in effect for THIS run (see SWAP_WIFI_ROLES). Without this,
+    # every run would see a "mismatch" against its own eth-less/eth-enabled format
+    # and rewrite the conf in a loop.
+    EXPECTED_UNMANAGED_LINE="unmanaged-devices=$(nm_unmanaged_devices_value "$AP_WIFI")"
+    if ! grep -qxF "$EXPECTED_UNMANAGED_LINE" "$NM_CONF" 2>/dev/null; then
+        echo "   ⚠️  NetworkManager.conf was written for different radio roles — rewriting..."
+        NM_NEEDS_REWRITE=true
+    fi
 fi
 
 if [ "$NM_NEEDS_REWRITE" = true ]; then
     echo "   Writing clean NetworkManager configuration..."
-    write_clean_nm_conf "$HOTEL_WIFI" "$AP_WIFI"
+    write_clean_nm_conf "$HOTEL_WIFI" "$AP_WIFI" "$ETH_INTERFACE"
     echo "   Restarting NetworkManager to apply config changes..."
     sudo systemctl restart NetworkManager 2>/dev/null || true
     sleep 5
@@ -328,11 +696,46 @@ else
     echo "   ✅ NetworkManager.conf is clean — no changes needed"
 fi
 
+# Clear leftover access-point state before using this interface as the hotel client.
+# After a role swap the interface that previously served the AP still holds $AP_GATEWAY
+# and is still in __ap mode, so it looks "UP with an IP address" while having no route
+# to the internet -- which fails the connectivity check for the wrong reason.
+HOTEL_IF_TYPE=$(iw dev "$HOTEL_WIFI" info 2>/dev/null | awk '/^\ttype/ {print $2}')
+if [ "$HOTEL_IF_TYPE" = "AP" ] || ip addr show "$HOTEL_WIFI" 2>/dev/null | grep -q "inet ${AP_GATEWAY}/"; then
+    echo "   🔧 $HOTEL_WIFI has leftover access-point state - clearing it..."
+    sudo systemctl stop hostapd 2>/dev/null || true
+    sudo systemctl stop dnsmasq 2>/dev/null || true
+    # Hand the device to NetworkManager AFTER the raw cleanup, not before. Running
+    # "ip link set" / "iw set type" on a device NetworkManager is managing makes it drop
+    # the device to unmanaged -- the same trap this script warns about elsewhere. Mark it
+    # unmanaged first, do the raw work, then restart NetworkManager so it re-enumerates
+    # the device from scratch instead of holding stale state.
+    sudo nmcli device set "$HOTEL_WIFI" managed no 2>/dev/null || true
+    sleep 1
+    sudo ip addr flush dev "$HOTEL_WIFI" 2>/dev/null || true
+    sudo ip link set "$HOTEL_WIFI" down 2>/dev/null || true
+    sudo iw dev "$HOTEL_WIFI" set type managed 2>/dev/null || true
+    sudo ip link set "$HOTEL_WIFI" up 2>/dev/null || true
+    sudo systemctl restart NetworkManager 2>/dev/null || true
+    sleep 5
+    sudo nmcli device set "$HOTEL_WIFI" managed yes 2>/dev/null || true
+    sudo nmcli radio wifi on 2>/dev/null || true
+    sleep 2
+    CLEARED_STATE=$(nmcli device status 2>/dev/null | grep "^$HOTEL_WIFI" | awk '{print $3}' || echo "")
+    if [ "$CLEARED_STATE" = "unmanaged" ] || [ -z "$CLEARED_STATE" ]; then
+        echo "   ❌ $HOTEL_WIFI is still unmanaged after clearing access-point state."
+        echo "      Recover with: sudo nmcli device set $HOTEL_WIFI managed yes"
+        echo "                    sudo systemctl restart NetworkManager"
+    else
+        echo "   ✅ Cleared - $HOTEL_WIFI is now $CLEARED_STATE"
+    fi
+fi
+
 # CRITICAL FIX: Check if hotel WiFi interface is managed by NetworkManager
 if systemctl is-active --quiet NetworkManager 2>/dev/null; then
     HOTEL_WIFI_STATE=$(nmcli device status 2>/dev/null | grep "^$HOTEL_WIFI" | awk '{print $3}' || echo "")
     if [ "$HOTEL_WIFI_STATE" = "unmanaged" ] || [ "$HOTEL_WIFI_STATE" = "unavailable" ]; then
-        echo "   ⚠️  $HOTEL_WIFI (USB adapter) is $HOTEL_WIFI_STATE - fixing before proceeding..."
+        echo "   ⚠️  $HOTEL_WIFI (hotel interface) is $HOTEL_WIFI_STATE - fixing before proceeding..."
         sudo nmcli device set "$HOTEL_WIFI" managed yes 2>/dev/null || true
         sudo nmcli radio wifi on 2>/dev/null || true
         echo "   Restarting NetworkManager to apply changes..."
@@ -373,13 +776,30 @@ if [ "$HOTEL_WIFI_STATE" = "disconnected" ]; then
     # Get list of available SSIDs
     AVAILABLE_SSIDS=$(nmcli -t -f SSID device wifi list ifname "$HOTEL_WIFI" 2>/dev/null | sort -u | grep -v "^$" || echo "")
 
-    # Get list of saved connections (wifi only)
-    SAVED_CONNECTIONS=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep ":wifi$" | cut -d: -f1 || echo "")
+    # Unpin saved Wi-Fi profiles so they can activate on whichever radio currently holds
+    # the hotel role. nmtui records the interface a profile was created on (and sometimes
+    # the adapter MAC), which stops that profile activating on the other radio after
+    # SWAP_WIFI_ROLES is toggled -- the network is in range and the password is saved, but
+    # NetworkManager refuses to use it. Iterate by UUID: profile names contain spaces.
+    nmcli -t -f UUID,TYPE connection show 2>/dev/null \
+        | grep -E ':(wifi|802-11-wireless)$' | cut -d: -f1 \
+        | while IFS= read -r conn_uuid; do
+            [ -n "$conn_uuid" ] || continue
+            sudo nmcli connection modify uuid "$conn_uuid" connection.interface-name "" 2>/dev/null || true
+            sudo nmcli connection modify uuid "$conn_uuid" 802-11-wireless.mac-address "" 2>/dev/null || true
+        done
 
-    # Try to connect to any saved network that's available
+    # Get list of saved connections (wifi only). Strip only the trailing type field --
+    # cut -d: would truncate any SSID containing a colon.
+    SAVED_CONNECTIONS=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep -E ':(wifi|802-11-wireless)$' | sed -E 's/:(wifi|802-11-wireless)$//' || echo "")
+
+    # Try to connect to any saved network that's available.
+    # NOTE: read line-by-line rather than "for saved in $SAVED_CONNECTIONS" -- word
+    # splitting broke every SSID containing a space (e.g. "LA BRiCHE" -> "LA", "BRiCHE").
     CONNECTED=false
-    for saved in $SAVED_CONNECTIONS; do
-        if echo "$AVAILABLE_SSIDS" | grep -qx "$saved"; then
+    while IFS= read -r saved; do
+        [ -n "$saved" ] || continue
+        if echo "$AVAILABLE_SSIDS" | grep -qxF "$saved"; then
             echo "   Found saved network '$saved' - attempting to connect..."
             if nmcli device wifi connect "$saved" ifname "$HOTEL_WIFI" 2>/dev/null; then
                 echo "   ✅ Connected to '$saved'"
@@ -390,7 +810,7 @@ if [ "$HOTEL_WIFI_STATE" = "disconnected" ]; then
                 echo "   ⚠️  Failed to connect to '$saved', trying next..."
             fi
         fi
-    done
+    done <<< "$SAVED_CONNECTIONS"
 
     if [ "$CONNECTED" = false ]; then
         echo "   ⚠️  Could not auto-connect to any saved network"
@@ -400,7 +820,7 @@ if [ "$HOTEL_WIFI_STATE" = "disconnected" ]; then
 fi
 
 echo ""
-echo "=== Checking hotel Wi-Fi connection (via USB adapter: $HOTEL_WIFI) ==="
+echo "=== Checking hotel Wi-Fi connection (via $HOTEL_WIFI) ==="
 
 # Get the actual interface state (handle all states, not just UP/DOWN)
 HOTEL_IFACE_STATE=$(ip link show "$HOTEL_WIFI" 2>/dev/null | grep -oP 'state \K\S+' || echo "UNKNOWN")
@@ -428,8 +848,23 @@ fi
 
 # Test internet connectivity BEFORE making any changes
 echo "   Testing internet connectivity..."
-if ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
+if check_internet; then
     echo "✅ Internet connectivity confirmed - proceeding with tunnel setup"
+
+    # Disable Wi-Fi power save on the hotel-facing radio. At APs with a long
+    # beacon interval, power save leaves the radio dozing between beacons, so
+    # buffered frames (including ICMP replies) can sit for seconds before
+    # delivery -- the multi-second RTTs / packet loss this script now works
+    # around in check_internet(). Turning it off avoids the problem at the
+    # source instead of just tolerating it.
+    echo "🔧 Disabling Wi-Fi power save on $HOTEL_WIFI..."
+    sudo iw dev "$HOTEL_WIFI" set power_save off 2>/dev/null || true
+    HOTEL_ACTIVE_CONN=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep ":$HOTEL_WIFI\$" | cut -d: -f1 | head -1) || true
+    if [ -n "$HOTEL_ACTIVE_CONN" ]; then
+        sudo nmcli connection modify "$HOTEL_ACTIVE_CONN" 802-11-wireless.powersave 2 2>/dev/null || true
+    fi
+elif attempt_gateway_autofix "$HOTEL_WIFI" && check_internet; then
+    echo "✅ Internet connectivity confirmed after gateway autofix - proceeding with tunnel setup"
 else
     echo ""
     echo "❌ NO INTERNET CONNECTION DETECTED!"
@@ -461,8 +896,9 @@ echo ""
 ensure_nm_wlan0_managed() {
     local onboard_wifi="${ONBOARD_WIFI:-wlan0}"
     local usb_wifi="${USB_WIFI:-wlan1}"
+    local eth_wifi="${ETH_INTERFACE:-}"
 
-    write_clean_nm_conf "$onboard_wifi" "$usb_wifi"
+    write_clean_nm_conf "$onboard_wifi" "$usb_wifi" "$eth_wifi"
 
     if systemctl is-active --quiet NetworkManager 2>/dev/null; then
         sudo nmcli device set "$onboard_wifi" managed yes 2>/dev/null || true
@@ -514,8 +950,9 @@ force_wlan0_managed_after_restart() {
 ensure_nm_config_correct() {
     local onboard_wifi="${ONBOARD_WIFI:-wlan0}"
     local usb_wifi="${USB_WIFI:-wlan1}"
+    local eth_wifi="${ETH_INTERFACE:-}"
 
-    write_clean_nm_conf "$onboard_wifi" "$usb_wifi"
+    write_clean_nm_conf "$onboard_wifi" "$usb_wifi" "$eth_wifi"
 }
 
 # Call helper function at start to ensure config is correct from the beginning
@@ -531,21 +968,21 @@ sudo systemctl stop hostapd 2>/dev/null || true
 sudo systemctl stop dnsmasq 2>/dev/null || true
 
 # Reset network interfaces (except Tailscale)
-# CRITICAL: NEVER reset wlan0 if NetworkManager is running - it will break nmtui!
+# CRITICAL: NEVER reset $HOTEL_WIFI if NetworkManager is running - it will break nmtui!
 echo "Resetting network interfaces..."
-for iface in wlan0 wlan1; do
+for iface in $HOTEL_WIFI $AP_WIFI; do
     if ip link show $iface >/dev/null 2>&1; then
         echo "  Resetting $iface..."
         
-        # For wlan0: NEVER reset if NetworkManager is running - it will mark it as unmanaged!
-        if [ "$iface" = "wlan0" ] && systemctl is-active --quiet NetworkManager 2>/dev/null; then
-            echo "    (wlan0 - SKIPPING reset to preserve NetworkManager management)"
-            echo "    (NetworkManager must manage wlan0 for nmtui to work)"
-            echo "    (No manual reset needed - NetworkManager handles wlan0)"
-            # Don't touch wlan0 at all - let NetworkManager manage it completely
+        # For $HOTEL_WIFI: NEVER reset if NetworkManager is running - it will mark it as unmanaged!
+        if [ "$iface" = "$HOTEL_WIFI" ] && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+            echo "    ($HOTEL_WIFI - SKIPPING reset to preserve NetworkManager management)"
+            echo "    (NetworkManager must manage $HOTEL_WIFI for nmtui to work)"
+            echo "    (No manual reset needed - NetworkManager handles $HOTEL_WIFI)"
+            # Don't touch $HOTEL_WIFI at all - let NetworkManager manage it completely
             continue
         else
-            # For wlan1 or if NetworkManager not running: full reset
+            # For $AP_WIFI or if NetworkManager not running: full reset
             sudo ip link set $iface down 2>/dev/null || true
             sudo ip addr flush dev $iface 2>/dev/null || true
             sudo iw dev $iface set type managed 2>/dev/null || true
@@ -554,31 +991,31 @@ for iface in wlan0 wlan1; do
     fi
 done
 
-# DON'T restart NetworkManager if it's already running and managing wlan0
-# Restarting NetworkManager can cause it to lose track of wlan0
+# DON'T restart NetworkManager if it's already running and managing $HOTEL_WIFI
+# Restarting NetworkManager can cause it to lose track of $HOTEL_WIFI
 if systemctl is-active --quiet NetworkManager 2>/dev/null; then
-    # Check if wlan0 is already being managed
-    NM_WLAN0_STATUS=$(nmcli device status 2>/dev/null | grep "^wlan0" || echo "")
+    # Check if $HOTEL_WIFI is already being managed
+    NM_WLAN0_STATUS=$(nmcli device status 2>/dev/null | grep "^$HOTEL_WIFI" || echo "")
     if [ -n "$NM_WLAN0_STATUS" ] && ! echo "$NM_WLAN0_STATUS" | grep -qE "(unmanaged|unavailable)"; then
-        echo "NetworkManager is managing wlan0 - no restart needed (preserving nmtui)"
+        echo "NetworkManager is managing $HOTEL_WIFI - no restart needed (preserving nmtui)"
         # Just ensure it stays managed
-        sudo nmcli device set wlan0 managed yes 2>/dev/null || true
+        sudo nmcli device set $HOTEL_WIFI managed yes 2>/dev/null || true
         sudo nmcli radio wifi on 2>/dev/null || true
     else
-        # wlan0 is unmanaged - try to fix without restarting NetworkManager first
-        echo "wlan0 appears unmanaged - attempting to fix without restart..."
-        sudo nmcli device set wlan0 managed yes 2>/dev/null || true
+        # $HOTEL_WIFI is unmanaged - try to fix without restarting NetworkManager first
+        echo "$HOTEL_WIFI appears unmanaged - attempting to fix without restart..."
+        sudo nmcli device set $HOTEL_WIFI managed yes 2>/dev/null || true
         sudo nmcli radio wifi on 2>/dev/null || true
         sleep 2
-        NM_WLAN0_CHECK=$(nmcli device status 2>/dev/null | grep "^wlan0" || echo "")
+        NM_WLAN0_CHECK=$(nmcli device status 2>/dev/null | grep "^$HOTEL_WIFI" || echo "")
         if [ -n "$NM_WLAN0_CHECK" ] && ! echo "$NM_WLAN0_CHECK" | grep -qE "(unmanaged|unavailable)"; then
-            echo "✅ Fixed! wlan0 is now managed: $(echo "$NM_WLAN0_CHECK" | awk '{print $3}')"
+            echo "✅ Fixed! $HOTEL_WIFI is now managed: $(echo "$NM_WLAN0_CHECK" | awk '{print $3}')"
         else
             # Only restart as last resort
             echo "Restarting NetworkManager as last resort..."
             ensure_nm_wlan0_managed  # Ensure config is correct before restart
             sudo systemctl restart NetworkManager 2>/dev/null || true
-            force_wlan0_managed_after_restart  # Force wlan0 to stay managed after restart
+            force_wlan0_managed_after_restart  # Force $HOTEL_WIFI to stay managed after restart
         fi
     fi
 fi
@@ -608,7 +1045,7 @@ sudo chattr +i /etc/resolv.conf 2>/dev/null || true
 
 # Test internet connectivity (early check)
 echo "Testing internet connectivity..."
-if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+if check_internet; then
     echo "✅ Internet connectivity confirmed"
     if ping -c 1 -W 2 google.com >/dev/null 2>&1; then
         echo "✅ DNS working"
@@ -623,14 +1060,22 @@ else
     
     ISSUES_FOUND=()
     AUTO_FIXED=false
-    
+
+    # Try the gateway autofix first - it's the least drastic option and it directly
+    # targets the hotel-DHCP-typo scenario (see attempt_gateway_autofix), which looks
+    # exactly like a normal outage otherwise: interface up, IP address present, but
+    # the advertised gateway itself is unreachable.
+    if attempt_gateway_autofix "$HOTEL_WIFI"; then
+        AUTO_FIXED=true
+    fi
+
     # Check if Wi-Fi interface exists
-    if ! ip link show wlan0 >/dev/null 2>&1; then
-        echo "❌ wlan0 interface does not exist"
-        ISSUES_FOUND+=("wlan0 interface missing")
+    if ! ip link show $HOTEL_WIFI >/dev/null 2>&1; then
+        echo "❌ $HOTEL_WIFI interface does not exist"
+        ISSUES_FOUND+=("$HOTEL_WIFI interface missing")
     else
-        echo "✅ wlan0 interface exists"
-        WLAN0_STATE=$(ip link show wlan0 2>/dev/null | awk '/state/ {for(i=1;i<=NF;i++) if($i=="state") print $(i+1)}' || echo "UNKNOWN")
+        echo "✅ $HOTEL_WIFI interface exists"
+        WLAN0_STATE=$(ip link show $HOTEL_WIFI 2>/dev/null | awk '/state/ {for(i=1;i<=NF;i++) if($i=="state") print $(i+1)}' || echo "UNKNOWN")
         echo "   Interface state: $WLAN0_STATE"
         
         # Try to bring interface up if it's down
@@ -650,8 +1095,8 @@ else
             
             # Fix 2: Ensure NetworkManager is managing it (needed for some interfaces)
             if systemctl is-active --quiet NetworkManager 2>/dev/null; then
-                echo "   🔧 Ensuring NetworkManager is managing wlan0..."
-                sudo nmcli device set wlan0 managed yes 2>/dev/null || true
+                echo "   🔧 Ensuring NetworkManager is managing $HOTEL_WIFI..."
+                sudo nmcli device set $HOTEL_WIFI managed yes 2>/dev/null || true
                 sudo nmcli radio wifi on 2>/dev/null || true
                 sleep 1
             fi
@@ -666,20 +1111,20 @@ else
             
             # Fix 4: Set interface type to managed (required before bringing up)
             echo "   🔧 Setting interface type to managed..."
-            sudo iw dev wlan0 set type managed 2>/dev/null || true
+            sudo iw dev $HOTEL_WIFI set type managed 2>/dev/null || true
             sleep 1
             
             # Fix 5: Try to bring interface up
             # CRITICAL: Use nmcli if NetworkManager is running, NOT ip link set!
-            # Using ip link set while NetworkManager is managing wlan0 causes it to become unmanaged
+            # Using ip link set while NetworkManager is managing $HOTEL_WIFI causes it to become unmanaged
             if systemctl is-active --quiet NetworkManager 2>/dev/null; then
                 echo "   🔧 Bringing interface up via NetworkManager (preserving management)..."
                 # Use NetworkManager to bring it up - this keeps it managed
-                sudo nmcli device set wlan0 managed yes 2>/dev/null || true
+                sudo nmcli device set $HOTEL_WIFI managed yes 2>/dev/null || true
                 sudo nmcli radio wifi on 2>/dev/null || true
                 sleep 2
                 # Try to activate any saved connection
-                SAVED_CONN=$(nmcli connection show 2>/dev/null | grep -E "wifi|wlan0" | head -1 | awk '{print $1}' || echo "")
+                SAVED_CONN=$(nmcli connection show 2>/dev/null | grep -E "wifi|$HOTEL_WIFI" | head -1 | awk '{print $1}' || echo "")
                 if [ -n "$SAVED_CONN" ]; then
                     echo "   🔧 Attempting to activate saved connection: $SAVED_CONN"
                     sudo nmcli connection up "$SAVED_CONN" 2>/dev/null || true
@@ -687,11 +1132,11 @@ else
                 fi
             else
                 echo "   🔧 Bringing interface up (NetworkManager not running)..."
-                sudo ip link set wlan0 up 2>/dev/null && sleep 2
+                sudo ip link set $HOTEL_WIFI up 2>/dev/null && sleep 2
             fi
             
             # Check if it worked
-            WLAN0_STATE=$(ip link show wlan0 2>/dev/null | awk '/state/ {for(i=1;i<=NF;i++) if($i=="state") print $(i+1)}' || echo "UNKNOWN")
+            WLAN0_STATE=$(ip link show $HOTEL_WIFI 2>/dev/null | awk '/state/ {for(i=1;i<=NF;i++) if($i=="state") print $(i+1)}' || echo "UNKNOWN")
             if [ "$WLAN0_STATE" = "UP" ]; then
                 echo "   ✅ Interface is now UP"
                 AUTO_FIXED=true
@@ -699,7 +1144,7 @@ else
                 echo "   ❌ Failed to bring interface up"
                 
                 # Check for hardware issues
-                if dmesg | tail -20 | grep -qi "wlan0.*error\|wlan0.*fail\|wlan0.*firmware"; then
+                if dmesg | tail -20 | grep -qi "$HOTEL_WIFI.*error\|$HOTEL_WIFI.*fail\|$HOTEL_WIFI.*firmware"; then
                     echo "   ⚠️  Possible hardware/driver issue detected in system logs"
                     ISSUES_FOUND+=("Interface DOWN - possible hardware/driver issue (check dmesg)")
                 else
@@ -707,20 +1152,20 @@ else
                 fi
                 
                 # Try one more thing: reload driver module
-                DRIVER_MODULE=$(ethtool -i wlan0 2>/dev/null | grep driver | awk '{print $2}' || echo "")
+                DRIVER_MODULE=$(ethtool -i $HOTEL_WIFI 2>/dev/null | grep driver | awk '{print $2}' || echo "")
                 if [ -n "$DRIVER_MODULE" ]; then
                     echo "   🔧 Attempting to reload driver module: $DRIVER_MODULE"
                     sudo modprobe -r $DRIVER_MODULE 2>/dev/null && sleep 1
                     sudo modprobe $DRIVER_MODULE 2>/dev/null && sleep 2
                     # CRITICAL: Use nmcli if NetworkManager is running
                     if systemctl is-active --quiet NetworkManager 2>/dev/null; then
-                        sudo nmcli device set wlan0 managed yes 2>/dev/null || true
+                        sudo nmcli device set $HOTEL_WIFI managed yes 2>/dev/null || true
                         sudo nmcli radio wifi on 2>/dev/null || true
                         sleep 2
                     else
-                        sudo ip link set wlan0 up 2>/dev/null && sleep 2
+                        sudo ip link set $HOTEL_WIFI up 2>/dev/null && sleep 2
                     fi
-                    WLAN0_STATE=$(ip link show wlan0 2>/dev/null | awk '/state/ {for(i=1;i<=NF;i++) if($i=="state") print $(i+1)}' || echo "UNKNOWN")
+                    WLAN0_STATE=$(ip link show $HOTEL_WIFI 2>/dev/null | awk '/state/ {for(i=1;i<=NF;i++) if($i=="state") print $(i+1)}' || echo "UNKNOWN")
                     if [ "$WLAN0_STATE" = "UP" ]; then
                         echo "   ✅ Interface is now UP after driver reload!"
                         AUTO_FIXED=true
@@ -731,8 +1176,8 @@ else
         
         # Check if it has an IP address
         if [ "$WLAN0_STATE" = "UP" ]; then
-            if ip addr show wlan0 | grep -q "inet "; then
-                WLAN0_IP=$(ip addr show wlan0 | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+            if ip addr show $HOTEL_WIFI | grep -q "inet "; then
+                WLAN0_IP=$(ip addr show $HOTEL_WIFI | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
                 echo "   ✅ Has IP address: $WLAN0_IP"
                 
                 # Check gateway
@@ -746,8 +1191,8 @@ else
                         ISSUES_FOUND+=("Gateway $GATEWAY not reachable")
                         # Try to renew DHCP
                         echo "   🔧 Attempting to renew DHCP lease..."
-                        sudo dhcpcd -n wlan0 2>/dev/null && sleep 3
-                        if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+                        sudo dhcpcd -n $HOTEL_WIFI 2>/dev/null && sleep 3
+                        if check_internet; then
                             echo "   ✅ Internet connectivity restored!"
                             AUTO_FIXED=true
                         fi
@@ -763,12 +1208,12 @@ else
                 # Check if NetworkManager can help
                 if systemctl is-active --quiet NetworkManager 2>/dev/null; then
                     echo "   🔧 NetworkManager is running - checking for saved connections..."
-                    if nmcli connection show --active 2>/dev/null | grep -q wlan0; then
+                    if nmcli connection show --active 2>/dev/null | grep -q $HOTEL_WIFI; then
                         echo "   🔧 Attempting to activate saved connection..."
-                        SAVED_CONN=$(nmcli connection show 2>/dev/null | grep wlan0 | head -1 | awk '{print $1}' || echo "")
+                        SAVED_CONN=$(nmcli connection show 2>/dev/null | grep $HOTEL_WIFI | head -1 | awk '{print $1}' || echo "")
                         if [ -n "$SAVED_CONN" ]; then
                             sudo nmcli connection up "$SAVED_CONN" 2>/dev/null && sleep 5
-                            if ip addr show wlan0 | grep -q "inet "; then
+                            if ip addr show $HOTEL_WIFI | grep -q "inet "; then
                                 echo "   ✅ Connected to saved Wi-Fi network!"
                                 AUTO_FIXED=true
                             fi
@@ -785,64 +1230,64 @@ else
         echo "🔄 Re-testing internet connectivity..."
         sleep 2
         
-        # Also ensure NetworkManager recognizes wlan0 after auto-fix
+        # Also ensure NetworkManager recognizes $HOTEL_WIFI after auto-fix
         if systemctl is-active --quiet NetworkManager 2>/dev/null; then
-            echo "   🔧 Ensuring NetworkManager recognizes wlan0 after auto-fix..."
-            sudo nmcli device set wlan0 managed yes 2>/dev/null || true
+            echo "   🔧 Ensuring NetworkManager recognizes $HOTEL_WIFI after auto-fix..."
+            sudo nmcli device set $HOTEL_WIFI managed yes 2>/dev/null || true
             sudo nmcli radio wifi on 2>/dev/null || true
             sleep 3
             # Verify
-            NM_WLAN0_CHECK=$(nmcli device status 2>/dev/null | grep "^wlan0" || echo "")
+            NM_WLAN0_CHECK=$(nmcli device status 2>/dev/null | grep "^$HOTEL_WIFI" || echo "")
             if [ -n "$NM_WLAN0_CHECK" ] && ! echo "$NM_WLAN0_CHECK" | grep -qE "(unmanaged|unavailable)"; then
-                echo "   ✅ NetworkManager recognizes wlan0: $(echo "$NM_WLAN0_CHECK" | awk '{print $3}')"
+                echo "   ✅ NetworkManager recognizes $HOTEL_WIFI: $(echo "$NM_WLAN0_CHECK" | awk '{print $3}')"
             else
-                echo "   ⚠️  NetworkManager may not recognize wlan0 - fixing WITHOUT restart..."
-                # CRITICAL: DO NOT restart NetworkManager - it will set wlan0 to unmanaged!
+                echo "   ⚠️  NetworkManager may not recognize $HOTEL_WIFI - fixing WITHOUT restart..."
+                # CRITICAL: DO NOT restart NetworkManager - it will set $HOTEL_WIFI to unmanaged!
                 # Instead, verify config file and set to managed multiple times
-                if grep -q "unmanaged-devices.*wlan0\|unmanaged-devices.*$ONBOARD_WIFI" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-                    echo "   ⚠️  Config file has wlan0 in unmanaged-devices! Fixing..."
-                    sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-                    sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
+                if grep -q "unmanaged-devices.*$HOTEL_WIFI\|unmanaged-devices.*$ONBOARD_WIFI" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
+                    echo "   ⚠️  Config file has $HOTEL_WIFI in unmanaged-devices! Fixing..."
+                    sudo sed -i "s/unmanaged-devices=.*$HOTEL_WIFI.*/unmanaged-devices=$(nm_unmanaged_devices_value "$USB_WIFI")/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
+                    sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=$(nm_unmanaged_devices_value "$USB_WIFI")/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
                     sudo nmcli general reload 2>/dev/null || true
                     sleep 2
                 fi
                 # Set to managed multiple times WITHOUT restarting
                 for attempt in 1 2 3 4 5 6 7 8; do
-                    sudo nmcli device set wlan0 managed yes 2>/dev/null || true
+                    sudo nmcli device set $HOTEL_WIFI managed yes 2>/dev/null || true
                     sleep 0.5
                     sudo nmcli radio wifi on 2>/dev/null || true
                     sleep 0.5
                 done
                 sleep 2
                 # Check again
-                NM_WLAN0_CHECK=$(nmcli device status 2>/dev/null | grep "^wlan0" || echo "")
+                NM_WLAN0_CHECK=$(nmcli device status 2>/dev/null | grep "^$HOTEL_WIFI" || echo "")
                 if [ -n "$NM_WLAN0_CHECK" ] && ! echo "$NM_WLAN0_CHECK" | grep -qE "(unmanaged|unavailable)"; then
-                    echo "   ✅ Fixed! wlan0 is now: $(echo "$NM_WLAN0_CHECK" | awk '{print $3}')"
+                    echo "   ✅ Fixed! $HOTEL_WIFI is now: $(echo "$NM_WLAN0_CHECK" | awk '{print $3}')"
                 else
                     echo "   ⚠️  Still unmanaged - but NOT restarting NetworkManager (would make it worse)"
                 fi
             fi
         fi
         
-        if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+        if check_internet; then
             echo "✅ Internet connectivity restored! Continuing..."
         else
             AUTO_FIXED=false
         fi
     fi
     
-    # If still no internet, ensure NetworkManager recognizes wlan0 before exiting
+    # If still no internet, ensure NetworkManager recognizes $HOTEL_WIFI before exiting
     # (Even if internet is broken, we want nmtui to work)
-    # CRITICAL: DO NOT restart NetworkManager here - it will set wlan0 to unmanaged!
+    # CRITICAL: DO NOT restart NetworkManager here - it will set $HOTEL_WIFI to unmanaged!
     if [ "$AUTO_FIXED" = false ] && systemctl is-active --quiet NetworkManager 2>/dev/null; then
         echo ""
-        echo "🔧 Ensuring NetworkManager recognizes wlan0 (for nmtui) before exiting..."
+        echo "🔧 Ensuring NetworkManager recognizes $HOTEL_WIFI (for nmtui) before exiting..."
         
         # First, verify config file is correct (don't restart NetworkManager!)
-        if grep -q "unmanaged-devices.*wlan0\|unmanaged-devices.*$ONBOARD_WIFI" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-            echo "   ⚠️  Config file has wlan0 in unmanaged-devices! Fixing..."
-            sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-            sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
+        if grep -q "unmanaged-devices.*$HOTEL_WIFI\|unmanaged-devices.*$ONBOARD_WIFI" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
+            echo "   ⚠️  Config file has $HOTEL_WIFI in unmanaged-devices! Fixing..."
+            sudo sed -i "s/unmanaged-devices=.*$HOTEL_WIFI.*/unmanaged-devices=$(nm_unmanaged_devices_value "$USB_WIFI")/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
+            sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=$(nm_unmanaged_devices_value "$USB_WIFI")/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
             # Reload config WITHOUT restarting
             sudo nmcli general reload 2>/dev/null || true
             sleep 2
@@ -850,7 +1295,7 @@ else
         
         # Set to managed multiple times WITHOUT restarting NetworkManager
         for attempt in 1 2 3 4 5; do
-            sudo nmcli device set wlan0 managed yes 2>/dev/null || true
+            sudo nmcli device set $HOTEL_WIFI managed yes 2>/dev/null || true
             sleep 1
             sudo nmcli radio wifi on 2>/dev/null || true
             sleep 1
@@ -858,41 +1303,41 @@ else
         
         # Final check with delay to catch any reversions
         sleep 3
-        NM_WLAN0_FINAL=$(nmcli device status 2>/dev/null | grep "^wlan0" || echo "")
+        NM_WLAN0_FINAL=$(nmcli device status 2>/dev/null | grep "^$HOTEL_WIFI" || echo "")
         
         # Also verify config file one more time
-        if grep -q "unmanaged-devices.*wlan0\|unmanaged-devices.*$ONBOARD_WIFI" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
-            echo "   ⚠️  Config file STILL has wlan0 in unmanaged-devices! Fixing again..."
-            sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-            sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
+        if grep -q "unmanaged-devices.*$HOTEL_WIFI\|unmanaged-devices.*$ONBOARD_WIFI" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
+            echo "   ⚠️  Config file STILL has $HOTEL_WIFI in unmanaged-devices! Fixing again..."
+            sudo sed -i "s/unmanaged-devices=.*$HOTEL_WIFI.*/unmanaged-devices=$(nm_unmanaged_devices_value "$USB_WIFI")/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
+            sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=$(nm_unmanaged_devices_value "$USB_WIFI")/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
             sudo nmcli general reload 2>/dev/null || true
             sleep 2
             # Set to managed again
             for i in 1 2 3 4 5; do
-                sudo nmcli device set wlan0 managed yes 2>/dev/null || true
+                sudo nmcli device set $HOTEL_WIFI managed yes 2>/dev/null || true
                 sleep 0.5
             done
             sleep 2
-            NM_WLAN0_FINAL=$(nmcli device status 2>/dev/null | grep "^wlan0" || echo "")
+            NM_WLAN0_FINAL=$(nmcli device status 2>/dev/null | grep "^$HOTEL_WIFI" || echo "")
         fi
         
         # Check the actual status - need to verify it's NOT unmanaged (explicit check)
         WLAN0_STATUS=$(echo "$NM_WLAN0_FINAL" | awk '{print $3}' || echo "unknown")
         if [ -n "$NM_WLAN0_FINAL" ] && [ "$WLAN0_STATUS" != "unmanaged" ] && [ "$WLAN0_STATUS" != "unavailable" ]; then
-            echo "   ✅ NetworkManager recognizes wlan0: $WLAN0_STATUS"
+            echo "   ✅ NetworkManager recognizes $HOTEL_WIFI: $WLAN0_STATUS"
             echo "   ✅ nmtui should show wireless networks"
             # Show config file contents for debugging
             echo "   📋 Config file unmanaged-devices: $(grep 'unmanaged-devices' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || echo 'none')"
         else
-            echo "   ⚠️  wlan0 status: $(echo "$NM_WLAN0_FINAL" | awk '{print $3}' || echo 'not found')"
+            echo "   ⚠️  $HOTEL_WIFI status: $(echo "$NM_WLAN0_FINAL" | awk '{print $3}' || echo 'not found')"
             echo "   📋 Config file unmanaged-devices: $(grep 'unmanaged-devices' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || echo 'none')"
-            echo "   🔧 Attempting AGGRESSIVE fix to force wlan0 to be managed..."
+            echo "   🔧 Attempting AGGRESSIVE fix to force $HOTEL_WIFI to be managed..."
             
             # AGGRESSIVE FIX: Ensure config is perfect, then force NetworkManager to apply it
             ensure_nm_config_correct
             
             # Remove any NetworkManager connection profiles that might be interfering
-            sudo nmcli connection delete wlan0 2>/dev/null || true
+            sudo nmcli connection delete $HOTEL_WIFI 2>/dev/null || true
             
             # Force reload and set managed with multiple attempts
             sudo nmcli general reload 2>/dev/null || true
@@ -1056,10 +1501,17 @@ WAIT_COUNT=0
 NETWORK_READY=0
 
 while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
-    if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+    if check_internet; then
         echo "✅ Network connectivity confirmed"
         NETWORK_READY=1
         break
+    fi
+    # A broken DHCP-advertised gateway never heals by waiting -- and the
+    # NetworkManager restart just above re-ran DHCP, which re-installs the bad
+    # gateway and wipes any repair made during the earlier connectivity check.
+    # Try the autofix once, a few seconds in.
+    if [ $WAIT_COUNT -eq 10 ]; then
+        attempt_gateway_autofix "$HOTEL_WIFI" || true
     fi
     echo "   Waiting for network... ($WAIT_COUNT/$MAX_WAIT seconds)"
     sleep 2
@@ -1094,9 +1546,13 @@ if [ $NETWORK_READY -eq 0 ]; then
             echo "   🔧 Renewing DHCP lease..."
             sudo dhcpcd -n wlan0 2>/dev/null && sleep 3
         fi
-        
+
+        # The renew above re-installs whatever gateway DHCP hands out -- if that
+        # gateway is the broken one, repair it again before the final test.
+        attempt_gateway_autofix "$HOTEL_WIFI" || true
+
         # Test again
-        if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+        if check_internet; then
             echo "   ✅ Internet connectivity restored! Continuing..."
             NETWORK_READY=1
         fi
@@ -1355,7 +1811,14 @@ sudo systemctl stop hostapd || true
 sudo systemctl stop dnsmasq || true
 sudo pkill hostapd || true
 
-# Configure interface for AP mode
+# Disable Wi-Fi power saving while the adapter is still in managed mode. Some
+# drivers (notably mt7921u) accept the command in AP mode but immediately report
+# "Power save: on" again. Applying it before the type change gives the setting a
+# chance to persist when hostapd takes ownership.
+sudo ip link set $USB_WIFI down || true
+sudo iw dev $USB_WIFI set type managed 2>/dev/null || true
+sudo ip link set $USB_WIFI up || true
+sudo iw dev $USB_WIFI set power_save off 2>/dev/null || true
 sudo ip link set $USB_WIFI down || true
 sudo iw dev $USB_WIFI set type __ap || echo "Interface $USB_WIFI already in AP mode or busy"
 sudo ip link set $USB_WIFI up || true
@@ -1385,12 +1848,33 @@ else
     echo "   USB power management rule already exists"
 fi
 
-# Disable WiFi power save on BOTH interfaces
-sudo iw dev $USB_WIFI set power_save off 2>/dev/null || true
-echo "   Disabled WiFi power save on $USB_WIFI (AP)"
+# Make power saving default to off for every Wi-Fi connection NetworkManager
+# creates. The AP is unmanaged once hostapd owns it, but this also protects the
+# hotel/uplink radio and preserves the setting while interfaces change roles.
+NM_POWERSAVE_CONF="/etc/NetworkManager/conf.d/90-tunnel-wifi-powersave-off.conf"
+sudo tee "$NM_POWERSAVE_CONF" > /dev/null <<'EOF'
+[connection]
+wifi.powersave=2
+EOF
+sudo nmcli general reload 2>/dev/null || true
+echo "   Created persistent NetworkManager Wi-Fi power-save override"
 
-sudo iw dev $HOTEL_WIFI set power_save off 2>/dev/null || true
-echo "   Disabled WiFi power save on $HOTEL_WIFI (hotel WiFi)"
+# Disable WiFi power save on BOTH interfaces
+sudo iw dev "$USB_WIFI" set power_save off 2>/dev/null || true
+USB_POWER_SAVE=$(iw dev "$USB_WIFI" get power_save 2>/dev/null | awk '{print $3}' || echo "unknown")
+if [ "$USB_POWER_SAVE" = "off" ]; then
+    echo "   Disabled WiFi power save on $USB_WIFI (AP)"
+else
+    echo "   ⚠️  $USB_WIFI driver still reports power save '$USB_POWER_SAVE' in AP mode"
+fi
+
+sudo iw dev "$HOTEL_WIFI" set power_save off 2>/dev/null || true
+HOTEL_POWER_SAVE=$(iw dev "$HOTEL_WIFI" get power_save 2>/dev/null | awk '{print $3}' || echo "unknown")
+if [ "$HOTEL_POWER_SAVE" = "off" ]; then
+    echo "   Disabled WiFi power save on $HOTEL_WIFI (hotel WiFi)"
+else
+    echo "   ⚠️  $HOTEL_WIFI driver still reports power save '$HOTEL_POWER_SAVE'"
+fi
 
 # NetworkManager will remain enabled for hotel Wi-Fi (wlan0) so nmtui works
 # Only USB Wi-Fi (wlan1) will be unmanaged (AP mode)
@@ -1407,7 +1891,7 @@ echo "   (Only $USB_WIFI is unmanaged because it's in AP mode)"
 
 # Write a clean NetworkManager.conf from scratch (replaces all awk/sed cleanup)
 echo "Writing clean NetworkManager configuration..."
-write_clean_nm_conf "$ONBOARD_WIFI" "$USB_WIFI"
+write_clean_nm_conf "$ONBOARD_WIFI" "$USB_WIFI" "$ETH_INTERFACE"
 echo "✅ NetworkManager.conf is clean"
 
 # Ensure USB Wi-Fi is explicitly unmanaged
@@ -1440,8 +1924,8 @@ if [ -z "$NM_WLAN0_CHECK" ] || echo "$NM_WLAN0_CHECK" | grep -qE "(unmanaged|una
     # If config is wrong, NetworkManager will set wlan0 to unmanaged on restart
     if grep -q "unmanaged-devices.*$ONBOARD_WIFI\|unmanaged-devices.*wlan0" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
         echo "   ⚠️  Config file still has wlan0 in unmanaged-devices! Fixing..."
-        sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-        sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
+        sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=$(nm_unmanaged_devices_value "$USB_WIFI")/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
+        sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=$(nm_unmanaged_devices_value "$USB_WIFI")/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
     fi
     
     # Verify config file structure is clean (no duplicate [keyfile] sections)
@@ -1449,19 +1933,19 @@ if [ -z "$NM_WLAN0_CHECK" ] || echo "$NM_WLAN0_CHECK" | grep -qE "(unmanaged|una
     if [ "$KEYFILE_COUNT" -gt 1 ]; then
         echo "   ⚠️  Found $KEYFILE_COUNT [keyfile] sections! Cleaning up..."
         # Use the same cleanup method as before
-        sudo awk -v usb_wifi="$USB_WIFI" '
+        sudo awk -v unmanaged_val="$(nm_unmanaged_devices_value "$USB_WIFI")" '
             BEGIN { in_keyfile=0; keyfile_added=0 }
-            /^\[keyfile\]/ { 
+            /^\[keyfile\]/ {
                 if (!keyfile_added) {
                     print ""
                     print "[keyfile]"
-                    print "unmanaged-devices=interface-name:" usb_wifi
+                    print "unmanaged-devices=" unmanaged_val
                     keyfile_added=1
                 }
                 in_keyfile=1
                 next
             }
-            /^\[/ { 
+            /^\[/ {
                 if (in_keyfile) { in_keyfile=0 }
                 print
                 next
@@ -1472,7 +1956,7 @@ if [ -z "$NM_WLAN0_CHECK" ] || echo "$NM_WLAN0_CHECK" | grep -qE "(unmanaged|una
                 if (!keyfile_added) {
                     print ""
                     print "[keyfile]"
-                    print "unmanaged-devices=interface-name:" usb_wifi
+                    print "unmanaged-devices=" unmanaged_val
                 }
             }
         ' /etc/NetworkManager/NetworkManager.conf > /tmp/nm_conf_pre_restart 2>/dev/null
@@ -1487,8 +1971,8 @@ if [ -z "$NM_WLAN0_CHECK" ] || echo "$NM_WLAN0_CHECK" | grep -qE "(unmanaged|una
     echo "   Verifying config file is perfect before restart..."
     if grep -q "unmanaged-devices.*wlan0\|unmanaged-devices.*$ONBOARD_WIFI" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
         echo "   ⚠️  Config file has wlan0 in unmanaged-devices! Fixing..."
-        sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-        sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
+        sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=$(nm_unmanaged_devices_value "$USB_WIFI")/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
+        sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=$(nm_unmanaged_devices_value "$USB_WIFI")/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
         sudo sed -i "s/unmanaged-devices=interface-name:$ONBOARD_WIFI;interface-name:$USB_WIFI/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
         sudo sed -i "s/unmanaged-devices=interface-name:$USB_WIFI;interface-name:$ONBOARD_WIFI/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
     fi
@@ -1518,7 +2002,7 @@ else
     echo "   🔧 Attempting AGGRESSIVE emergency fix..."
     
     echo "   Step 1: Rewriting clean NetworkManager config..."
-    write_clean_nm_conf "$ONBOARD_WIFI" "$USB_WIFI"
+    write_clean_nm_conf "$ONBOARD_WIFI" "$USB_WIFI" "$ETH_INTERFACE"
     
     # Step 3: Restart NetworkManager
     echo "   Step 2: Restarting NetworkManager..."
@@ -1543,13 +2027,34 @@ fi
 # hostapd uses: g (2.4GHz), a (5GHz), n (2.4GHz), but NOT "ac" directly
 # For "ac" mode, we use hw_mode=a and enable 802.11ac features
 HOSTAPD_HW_MODE="${AP_HW_MODE:-g}"
-if [ "$HOSTAPD_HW_MODE" = "ac" ]; then
-    HOSTAPD_HW_MODE="a"  # hostapd uses "a" for 5GHz, then we enable ac features
+if [ "$HOSTAPD_HW_MODE" = "ac" ] || [ "$HOSTAPD_HW_MODE" = "n" ]; then
+    # hostapd only accepts a/b/g here; n and ac are expressed via the
+    # ieee80211n/ieee80211ac flags below.
+    if [ "$HOSTAPD_HW_MODE" = "ac" ]; then HOSTAPD_HW_MODE="a"; else HOSTAPD_HW_MODE="g"; fi
 fi
+
+# Without ieee80211n=1 hostapd ignores ieee80211ac/ax and falls back to legacy
+# 11a/11g rates (54 Mbps PHY, ~5-20 Mbps real). Derive the HT40 secondary
+# channel side and the 80 MHz center for the configured channel; channels with
+# no 40/80 MHz partner (e.g. 165) simply stay at 20 MHz.
+HT40_SIDE=""
+VHT_CENTER=""
+case "${AP_CHANNEL:-6}" in
+    36|44|149|157) HT40_SIDE="[HT40+]" ;;
+    40|48|153|161) HT40_SIDE="[HT40-]" ;;
+esac
+case "${AP_CHANNEL:-6}" in
+    36|40|44|48)     VHT_CENTER=42 ;;
+    149|153|157|161) VHT_CENTER=155 ;;
+esac
+HT_CAPAB="[SHORT-GI-20]"
+[ -n "$HT40_SIDE" ] && HT_CAPAB="${HT40_SIDE}[SHORT-GI-20][SHORT-GI-40]"
 
 sudo tee /etc/hostapd/hostapd.conf > /dev/null <<EOF
 interface=$USB_WIFI
 driver=nl80211
+ctrl_interface=/var/run/hostapd
+ctrl_interface_group=0
 ssid=$AP_SSID
 hw_mode=$HOSTAPD_HW_MODE
 channel=${AP_CHANNEL:-6}
@@ -1563,9 +2068,20 @@ wpa=2
 wpa_passphrase=$AP_PASSWORD
 wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
+ieee80211n=1
+ht_capab=$HT_CAPAB
 $(if [ "${AP_HW_MODE:-g}" = "a" ] || [ "${AP_HW_MODE:-g}" = "ac" ]; then
   echo "ieee80211ac=1"
+  echo "vht_capab=[SHORT-GI-80]"
+  if [ -n "$VHT_CENTER" ]; then
+    echo "vht_oper_chwidth=1"
+    echo "vht_oper_centr_freq_seg0_idx=$VHT_CENTER"
+  fi
   echo "ieee80211ax=1"
+  if [ -n "$VHT_CENTER" ]; then
+    echo "he_oper_chwidth=1"
+    echo "he_oper_centr_freq_seg0_idx=$VHT_CENTER"
+  fi
 fi)
 EOF
 
@@ -1574,11 +2090,28 @@ sudo sed -i 's|#DAEMON_CONF="".*|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/
 # --- DHCP / DNS ---
 echo "=== Configuring dnsmasq ==="
 sudo mv /etc/dnsmasq.conf /etc/dnsmasq.conf.backup || true
+
+# Build the optional ethernet fragment up front so the single heredoc below stays
+# unchanged when ETH_ENABLE is not active. Both dhcp-ranges are tagged (ap/eth) so
+# each subnet only gets its own gateway/DNS options instead of cross-serving them.
+ETH_DNSMASQ_BLOCK=""
+if [ "$ETH_ENABLED" = true ]; then
+    ETH_DNSMASQ_BLOCK=$(cat <<ETHEOF
+
+# Ethernet internet sharing (ETH_ENABLE=true)
+interface=$ETH_INTERFACE
+dhcp-range=set:eth,$ETH_DHCP_START,$ETH_DHCP_END,${DHCP_LEASE_TIME:-12h}
+dhcp-option=tag:eth,3,$ETH_GATEWAY
+dhcp-option=tag:eth,6,$ETH_GATEWAY
+ETHEOF
+)
+fi
+
 sudo tee /etc/dnsmasq.conf > /dev/null <<EOF
 interface=$USB_WIFI
-dhcp-range=$DHCP_START,$DHCP_END,${DHCP_LEASE_TIME:-12h}
-dhcp-option=3,$AP_GATEWAY
-dhcp-option=6,$AP_GATEWAY
+dhcp-range=set:ap,$DHCP_START,$DHCP_END,${DHCP_LEASE_TIME:-12h}
+dhcp-option=tag:ap,3,$AP_GATEWAY
+dhcp-option=tag:ap,6,$AP_GATEWAY
 # CRITICAL: no-resolv stops dnsmasq merging /etc/resolv.conf nameservers into its
 # upstream pool. Without it, "server=" is additive, not exclusive -- if anything
 # (NetworkManager, dhcpcd) writes the local network's DNS into resolv.conf, client
@@ -1587,12 +2120,33 @@ no-resolv
 server=${TAILSCALE_DNS:-100.100.100.100}
 log-queries
 log-dhcp
+${ETH_DNSMASQ_BLOCK}
 EOF
 
 # --- Static IP for USB Wi-Fi (access point) ---
 echo "=== Setting static IP for $USB_WIFI ==="
-sudo tee -a /etc/dhcpcd.conf > /dev/null <<EOF
+# Remove the block added by a previous run before appending a new one. This used to be
+# a blind "tee -a", so every run stacked another copy -- and after a role swap the stale
+# entry kept assigning the AP address to what is now the hotel interface.
+sudo sed -i '/# >>> tunnel.sh managed block >>>/,/# <<< tunnel.sh managed block <<</d' /etc/dhcpcd.conf 2>/dev/null || true
 
+# Optional ethernet fragment: "nolink" is required so the static address exists at
+# boot even with no cable plugged in yet -- dnsmasq needs it to be able to serve DHCP
+# the moment a laptop is connected, without dhcpcd waiting for link-up first.
+ETH_DHCPCD_BLOCK=""
+if [ "$ETH_ENABLED" = true ]; then
+    ETH_DHCPCD_BLOCK=$(cat <<ETHEOF
+
+# Ethernet interface (internet sharing, ETH_ENABLE=true)
+interface $ETH_INTERFACE
+    static ip_address=${ETH_GATEWAY}/24
+    nolink
+ETHEOF
+)
+fi
+
+sudo tee -a /etc/dhcpcd.conf > /dev/null <<EOF
+# >>> tunnel.sh managed block >>>
 # Access Point interface
 interface $USB_WIFI
     static ip_address=${AP_GATEWAY}/24
@@ -1601,10 +2155,38 @@ interface $USB_WIFI
 # Hotel Wi-Fi interface (keep DHCP)
 interface $ONBOARD_WIFI
     # This will use DHCP to connect to hotel Wi-Fi
+${ETH_DHCPCD_BLOCK}
+# <<< tunnel.sh managed block <<<
 EOF
+
+# Assign the ethernet static address immediately so it works without a reboot
+# (dhcpcd's "nolink" handles it on future boots, but won't apply it retroactively
+# to an interface dhcpcd already brought up during this same run).
+if [ "$ETH_ENABLED" = true ]; then
+    echo "Assigning $ETH_GATEWAY to $ETH_INTERFACE now (no reboot required)..."
+    sudo ip addr flush dev "$ETH_INTERFACE" 2>/dev/null || true
+    sudo ip link set "$ETH_INTERFACE" up 2>/dev/null || true
+    sudo ip addr add ${ETH_GATEWAY}/24 dev "$ETH_INTERFACE" 2>/dev/null || echo "IP address already assigned to $ETH_INTERFACE"
+fi
 
 # --- More permissive nftables rules ---
 echo "=== Configuring nftables (permissive for setup) ==="
+
+# Optional ethernet fragments. Note: no eth<->hotel-Wi-Fi forwarding rule is added
+# here -- only eth<->tailscale0 -- so the wired client fails closed exactly like the
+# AP does if the tunnel ever drops, instead of silently falling back to raw internet.
+ETH_NFT_INPUT_BLOCK=""
+ETH_NFT_FORWARD_BLOCK=""
+if [ "$ETH_ENABLED" = true ]; then
+    ETH_NFT_INPUT_BLOCK="        # Allow ethernet internet-sharing traffic
+        iifname \"$ETH_INTERFACE\" accept
+"
+    ETH_NFT_FORWARD_BLOCK="        # Forward only between ethernet and Tailscale (force all traffic through VPN)
+        iifname \"$ETH_INTERFACE\" oifname \"tailscale0\" accept
+        iifname \"tailscale0\" oifname \"$ETH_INTERFACE\" accept
+"
+fi
+
 sudo tee /etc/nftables.conf > /dev/null <<EOF
 #!/usr/sbin/nft -f
 
@@ -1614,41 +2196,41 @@ table inet filter {
     chain input {
         type filter hook input priority 0;
         policy accept;  # More permissive during setup
-        
+
         # Always allow loopback
         iifname "lo" accept
-        
+
         # Allow established connections
         ct state established,related accept
-        
+
         # Allow SSH from anywhere (for setup)
         tcp dport 22 accept
-        
+
         # Allow DHCP
         udp dport { 67, 68 } accept
-        
+
         # Allow DNS
         udp dport 53 accept
         tcp dport 53 accept
-        
+
         # Allow access point traffic
         iifname "$USB_WIFI" accept
-        
-        # Allow hotel Wi-Fi traffic  
+
+        # Allow hotel Wi-Fi traffic
         iifname "$ONBOARD_WIFI" accept
-        
-        # Allow Tailscale when it comes up
+
+${ETH_NFT_INPUT_BLOCK}        # Allow Tailscale when it comes up
         iifname "tailscale0" accept
     }
 
     chain forward {
         type filter hook forward priority 0;
         policy accept;  # Permissive for now
-        
+
         # Forward only between access point and Tailscale (force all traffic through VPN)
         iifname "$USB_WIFI" oifname "tailscale0" accept
         iifname "tailscale0" oifname "$USB_WIFI" accept
-    }
+${ETH_NFT_FORWARD_BLOCK}    }
 
     chain output {
         type filter hook output priority 0;
@@ -1733,6 +2315,12 @@ sudo systemctl daemon-reload
 sudo systemctl enable tailscale-routing
 
 # Update the routing service to include all fixes
+# When ETH_ENABLE is active, mirror the AP's local-routing rules for the ethernet
+# subnet too, so Tailscale doesn't hijack traffic to/from the wired client.
+ETH_ROUTING_RULES=""
+if [ "$ETH_ENABLED" = true ]; then
+    ETH_ROUTING_RULES="ip rule add from ${ETH_IP_RANGE}.0/24 to ${ETH_IP_RANGE}.0/24 table main priority 100 2>/dev/null || true; ip rule add to ${ETH_IP_RANGE}.0/24 table main priority 50 2>/dev/null || true; "
+fi
 sudo tee /etc/systemd/system/tailscale-routing.service > /dev/null <<EOF
 [Unit]
 Description=Ensure Tailscale routing and fix conflicts
@@ -1741,7 +2329,7 @@ Wants=tailscale-exit.service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'sleep 5; ip rule add from ${AP_IP_RANGE}.0/24 to ${AP_IP_RANGE}.0/24 table main priority 100 2>/dev/null || true; ip rule add to ${AP_IP_RANGE}.0/24 table main priority 50 2>/dev/null || true; ip route del default dev tailscale0 2>/dev/null || true; ip route del 0.0.0.0/1 dev tailscale0 2>/dev/null || true; ip route del 128.0.0.0/1 dev tailscale0 2>/dev/null || true'
+ExecStart=/bin/bash -c 'sleep 5; ip rule add from ${AP_IP_RANGE}.0/24 to ${AP_IP_RANGE}.0/24 table main priority 100 2>/dev/null || true; ip rule add to ${AP_IP_RANGE}.0/24 table main priority 50 2>/dev/null || true; ${ETH_ROUTING_RULES}ip route del default dev tailscale0 2>/dev/null || true; ip route del 0.0.0.0/1 dev tailscale0 2>/dev/null || true; ip route del 128.0.0.0/1 dev tailscale0 2>/dev/null || true'
 RemainAfterExit=yes
 
 [Install]
@@ -1758,7 +2346,7 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'ip link set $AP_WIFI down 2>/dev/null || true; iw dev $AP_WIFI set type __ap 2>/dev/null || true; ip link set $AP_WIFI up 2>/dev/null || true; ip addr flush dev $AP_WIFI 2>/dev/null || true; ip addr add ${AP_GATEWAY}/24 dev $AP_WIFI 2>/dev/null || true'
+ExecStart=/bin/bash -c 'ip link set $AP_WIFI down 2>/dev/null || true; iw dev $AP_WIFI set type managed 2>/dev/null || true; ip link set $AP_WIFI up 2>/dev/null || true; iw dev $AP_WIFI set power_save off 2>/dev/null || true; ip link set $AP_WIFI down 2>/dev/null || true; iw dev $AP_WIFI set type __ap 2>/dev/null || true; ip link set $AP_WIFI up 2>/dev/null || true; iw dev $AP_WIFI set power_save off 2>/dev/null || true; ip addr flush dev $AP_WIFI 2>/dev/null || true; ip addr add ${AP_GATEWAY}/24 dev $AP_WIFI 2>/dev/null || true'
 RemainAfterExit=yes
 
 [Install]
@@ -1789,6 +2377,22 @@ cat > /tmp/tunnel-watchdog.sh <<SCRIPTEOF
 HOTEL_WIFI="$HOTEL_WIFI"
 AP_WIFI="$AP_WIFI"
 TAILSCALE_EXIT_NODE_IP="$TAILSCALE_EXIT_NODE_IP"
+ETH_ENABLED="$ETH_ENABLED"
+ETH_INTERFACE="$ETH_INTERFACE"
+ETH_GATEWAY="$ETH_GATEWAY"
+GATEWAY_AUTOFIX="$GATEWAY_AUTOFIX"
+AP_POWER_SAVE_WARNING_REPORTED=false
+
+# Same rationale as check_internet() in tunnel.sh: ICMP-hostile gateways and
+# Wi-Fi power save against a long-beacon-interval AP can make ping unreliable
+# while TCP still works. Fall back to TCP reachability before declaring the
+# link dead.
+wd_check_internet() {
+    ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && return 0
+    timeout 3 bash -c '>/dev/tcp/8.8.8.8/53' 2>/dev/null && return 0
+    timeout 3 bash -c '>/dev/tcp/1.1.1.1/443' 2>/dev/null && return 0
+    return 1
+}
 
 while true; do
     sleep 30  # Check every 30 seconds for faster recovery
@@ -1805,6 +2409,25 @@ while true; do
     if [ "\$POWER_SAVE" = "on" ]; then
         echo "[Watchdog] Power save was re-enabled on \$HOTEL_WIFI, disabling..."
         iw dev "\$HOTEL_WIFI" set power_save off 2>/dev/null || true
+    fi
+
+    # Keep power save off on the AP when the driver supports changing it in AP
+    # mode. Verify the result: mt7921u can return success while continuing to
+    # report "on", so an unverified command creates a misleading log loop.
+    AP_POWER_SAVE=\$(iw dev "\$AP_WIFI" get power_save 2>/dev/null | grep -o "on\|off" || echo "unknown")
+    if [ "\$AP_POWER_SAVE" = "on" ]; then
+        iw dev "\$AP_WIFI" set power_save off 2>/dev/null || true
+        sleep 1
+        AP_POWER_SAVE_AFTER=\$(iw dev "\$AP_WIFI" get power_save 2>/dev/null | grep -o "on\|off" || echo "unknown")
+        if [ "\$AP_POWER_SAVE_AFTER" = "off" ]; then
+            echo "[Watchdog] Disabled power save on \$AP_WIFI"
+            AP_POWER_SAVE_WARNING_REPORTED=false
+        elif [ "\$AP_POWER_SAVE_WARNING_REPORTED" != "true" ]; then
+            echo "[Watchdog] \$AP_WIFI driver refuses power_save=off in AP mode; applied before AP startup and will keep retrying silently"
+            AP_POWER_SAVE_WARNING_REPORTED=true
+        fi
+    else
+        AP_POWER_SAVE_WARNING_REPORTED=false
     fi
 
     # Ensure AP interface stays unmanaged (hostapd controls it)
@@ -1855,7 +2478,68 @@ while true; do
     fi
 
     # Check if we can reach internet
-    if ! ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+    if ! wd_check_internet; then
+        # --- Hotel DHCP gateway autofix (route-level only, never persisted) ---
+        # Same failure mode as the one-shot check in tunnel.sh: a hotel DHCP server
+        # can hand out a bogus gateway (e.g. a transposed-digit typo like 172.10.20.1
+        # instead of 172.20.10.1). Every DHCP renewal re-installs the bad gateway, so
+        # unlike tunnel.sh's one-shot fix, the watchdog must keep re-applying this on
+        # every loop instead of fixing it once. Deliberately does NOT call nmcli to
+        # pin the gateway - route-only, so nothing stale outlives this network.
+        WD_AUTOFIX_OK=false
+        if [ "\$GATEWAY_AUTOFIX" = "true" ]; then
+            WD_GW=\$(ip route show default dev "\$HOTEL_WIFI" 2>/dev/null | awk '{print \$3}' | head -1)
+            if [ -n "\$WD_GW" ]; then
+                WD_CIDR=\$(ip -o -f inet addr show "\$HOTEL_WIFI" 2>/dev/null | awk '{print \$4}' | head -1)
+                if [ -n "\$WD_CIDR" ]; then
+                    WD_IP_PART="\${WD_CIDR%/*}"
+                    WD_PREFIX="\${WD_CIDR#*/}"
+                    IFS='.' read -r WD_A WD_B WD_C WD_D <<< "\$WD_IP_PART"
+                    WD_IP_INT=\$(( (WD_A<<24) + (WD_B<<16) + (WD_C<<8) + WD_D ))
+                    if [ "\$WD_PREFIX" -eq 0 ] 2>/dev/null; then
+                        WD_MASK=0
+                    else
+                        WD_MASK=\$(( (0xFFFFFFFF << (32 - WD_PREFIX)) & 0xFFFFFFFF ))
+                    fi
+                    WD_NET_INT=\$(( WD_IP_INT & WD_MASK ))
+                    WD_CAND_INT=\$(( WD_NET_INT + 1 ))
+                    WD_CANDIDATE=\$(printf '%d.%d.%d.%d' \$(( (WD_CAND_INT>>24)&255 )) \$(( (WD_CAND_INT>>16)&255 )) \$(( (WD_CAND_INT>>8)&255 )) \$(( WD_CAND_INT&255 )))
+
+                    IFS='.' read -r WD_GA WD_GB WD_GC WD_GD <<< "\$WD_GW"
+                    WD_GW_INT=\$(( (WD_GA<<24) + (WD_GB<<16) + (WD_GC<<8) + WD_GD ))
+                    WD_GW_OUTSIDE=false
+                    if [ \$(( WD_GW_INT & WD_MASK )) -ne "\$WD_NET_INT" ]; then
+                        WD_GW_OUTSIDE=true
+                    fi
+
+                    ping -c 1 -W 1 "\$WD_GW" >/dev/null 2>&1 || true
+                    WD_NEIGH=\$(ip neigh show "\$WD_GW" dev "\$HOTEL_WIFI" 2>/dev/null)
+                    WD_NEIGH_BAD=false
+                    if [ -z "\$WD_NEIGH" ] || echo "\$WD_NEIGH" | grep -qiE 'INCOMPLETE|FAILED' || ! echo "\$WD_NEIGH" | grep -q 'lladdr'; then
+                        WD_NEIGH_BAD=true
+                    fi
+
+                    if { [ "\$WD_NEIGH_BAD" = true ] || [ "\$WD_GW_OUTSIDE" = true ]; } && [ "\$WD_CANDIDATE" != "\$WD_GW" ]; then
+                        echo "[Watchdog] Gateway \$WD_GW looks broken (ARP bad: \$WD_NEIGH_BAD, outside subnet: \$WD_GW_OUTSIDE) - trying \$WD_CANDIDATE (route-only, not persisted)..."
+                        if ip route replace default via "\$WD_CANDIDATE" dev "\$HOTEL_WIFI" 2>/dev/null && wd_check_internet; then
+                            echo "[Watchdog] Gateway autofix succeeded - now routing via \$WD_CANDIDATE"
+                            WD_AUTOFIX_OK=true
+                        else
+                            echo "[Watchdog] Gateway autofix candidate \$WD_CANDIDATE did not restore connectivity - reverting"
+                            ip route replace default via "\$WD_GW" dev "\$HOTEL_WIFI" 2>/dev/null || true
+                        fi
+                    fi
+                fi
+            fi
+        fi
+
+        # If the autofix above restored internet, skip the reconnect logic below for
+        # this cycle. A reconnect renews DHCP, which re-installs the bad gateway --
+        # and the real gateway may drop ping-to-self (this exact hotel's did), so the
+        # gateway ping below would be a false negative that undoes the repair.
+        if [ "\$WD_AUTOFIX_OK" = true ]; then
+            echo "[Watchdog] Gateway autofix restored internet - skipping reconnect this cycle"
+        else
         echo "[Watchdog] Internet unreachable, checking hotel Wi-Fi gateway..."
         GATEWAY=\$(ip route show dev "\$HOTEL_WIFI" | grep default | awk '{print \$3}' | head -1)
         if [ -n "\$GATEWAY" ]; then
@@ -1907,6 +2591,7 @@ while true; do
                 fi
             done
         fi
+        fi
     fi
 
     # ==========================================================================
@@ -1948,6 +2633,17 @@ while true; do
     if ! systemctl is-active --quiet dnsmasq 2>/dev/null; then
         echo "[Watchdog] dnsmasq is not running - restarting..."
         systemctl restart dnsmasq 2>/dev/null || true
+    fi
+
+    # ==========================================================================
+    # ETHERNET SHARING MONITORING - Check if the wired interface still holds its
+    # static gateway address (ETH_ENABLE=true only)
+    # ==========================================================================
+    if [ "\$ETH_ENABLED" = "true" ]; then
+        if ! ip addr show "\$ETH_INTERFACE" 2>/dev/null | grep -q "\$ETH_GATEWAY"; then
+            echo "[Watchdog] Ethernet interface \$ETH_INTERFACE lost \$ETH_GATEWAY - re-applying..."
+            ip addr add "\$ETH_GATEWAY/24" dev "\$ETH_INTERFACE" 2>/dev/null || true
+        fi
     fi
 done
 SCRIPTEOF
@@ -2006,6 +2702,15 @@ sudo nmcli device set $ONBOARD_WIFI managed yes 2>/dev/null || true
 sudo nmcli device set $USB_WIFI managed no 2>/dev/null || true
 sudo systemctl start usb-wifi-ap
 sudo systemctl start hostapd
+# hostapd may reset driver power state while bringing up the AP. Apply once more
+# after startup and report the actual state instead of assuming success.
+sudo iw dev "$AP_WIFI" set power_save off 2>/dev/null || true
+AP_POWER_SAVE_AFTER_START=$(iw dev "$AP_WIFI" get power_save 2>/dev/null | awk '{print $3}' || echo "unknown")
+if [ "$AP_POWER_SAVE_AFTER_START" = "off" ]; then
+    echo "✅ AP Wi-Fi power save is off"
+else
+    echo "⚠️  $AP_WIFI driver reports power save '$AP_POWER_SAVE_AFTER_START' in AP mode"
+fi
 sudo systemctl start dnsmasq
 sudo systemctl start tunnel-watchdog
 
@@ -2055,6 +2760,12 @@ sudo ip route del 128.0.0.0/1 dev tailscale0 2>/dev/null || true
 # Fix Tailscale hijacking local access point traffic
 sudo ip rule add from ${AP_IP_RANGE}.0/24 to ${AP_IP_RANGE}.0/24 table main priority 100 2>/dev/null || echo "Local routing rule already exists"
 sudo ip rule add to ${AP_IP_RANGE}.0/24 table main priority 50 2>/dev/null || echo "Return traffic routing rule already exists"
+
+# Fix Tailscale hijacking local ethernet client traffic (ETH_ENABLE=true)
+if [ "$ETH_ENABLED" = true ]; then
+    sudo ip rule add from ${ETH_IP_RANGE}.0/24 to ${ETH_IP_RANGE}.0/24 table main priority 100 2>/dev/null || echo "Local ethernet routing rule already exists"
+    sudo ip rule add to ${ETH_IP_RANGE}.0/24 table main priority 50 2>/dev/null || echo "Ethernet return traffic routing rule already exists"
+fi
 
 # Fix Tailscale hijacking local home network traffic
 # Get local network from wlan0 (home WiFi)
@@ -2262,6 +2973,20 @@ else
     fi
 fi
 
+# Check 8: Ethernet Sharing (only when ETH_ENABLE=true)
+ETH_SHARING_OK=false
+if [ "$ETH_ENABLED" = true ]; then
+    echo ""
+    echo "8️⃣ Ethernet Sharing:"
+    if ip addr show "$ETH_INTERFACE" 2>/dev/null | grep -q "$ETH_GATEWAY"; then
+        echo "   ✅ $ETH_INTERFACE has $ETH_GATEWAY - clients can connect via ethernet"
+        echo "   💡 ssh/VNC to $ETH_GATEWAY works even with no upstream internet"
+        ETH_SHARING_OK=true
+    else
+        echo "   ❌ $ETH_INTERFACE is missing $ETH_GATEWAY"
+    fi
+fi
+
 # Summary
 echo ""
 echo "🎯 === SETUP SUMMARY ==="
@@ -2272,9 +2997,15 @@ echo "  - USB Wi-Fi ($USB_WIFI): Access point '$AP_SSID'"
 echo "  - Access Point IP: $AP_GATEWAY"
 echo "  - SSID: $AP_SSID"
 echo "  - Password: $AP_PASSWORD"
+if [ "$ETH_ENABLED" = true ]; then
+    echo "  - Ethernet ($ETH_INTERFACE): Internet sharing at $ETH_GATEWAY"
+    echo "    Clients can connect a cable and reach the tunnel via $ETH_INTERFACE ($ETH_GATEWAY)"
+    echo "    ssh/VNC to $ETH_GATEWAY works even with no upstream internet"
+fi
 echo ""
 
 # Check if everything is working
+TOTAL_CHECKS=6
 CHECKS_PASSED=0
 if iwconfig $ONBOARD_WIFI 2>/dev/null | grep -q "ESSID:"; then ((CHECKS_PASSED++)); fi
 if sudo iw dev $USB_WIFI info | grep -q "type AP" && ip addr show $USB_WIFI | grep -q "$AP_GATEWAY"; then ((CHECKS_PASSED++)); fi
@@ -2282,8 +3013,12 @@ if systemctl is-active --quiet hostapd && systemctl is-active --quiet dnsmasq; t
 if sudo tailscale status | grep -q "$TAILSCALE_EXIT_NODE_NAME.*active.*exit node"; then ((CHECKS_PASSED++)); fi
 if ! ip route show | grep -q "0.0.0.0/1 dev tailscale0" && ! ip route show | grep -q "128.0.0.0/1 dev tailscale0"; then ((CHECKS_PASSED++)); fi
 if systemctl is-active --quiet tunnel-watchdog; then ((CHECKS_PASSED++)); fi
+if [ "$ETH_ENABLED" = true ]; then
+    TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+    if [ "$ETH_SHARING_OK" = true ]; then ((CHECKS_PASSED++)); fi
+fi
 
-if [ "$EXIT_NODE_WORKING" = true ] && [ $CHECKS_PASSED -eq 6 ]; then
+if [ "$EXIT_NODE_WORKING" = true ] && [ $CHECKS_PASSED -eq $TOTAL_CHECKS ]; then
     echo "🎉 ALL SYSTEMS GO! Your tunnel is ready!"
     echo "   Connect your devices to '$AP_SSID' and enjoy secure browsing!"
 elif [ $CHECKS_PASSED -ge 3 ]; then
@@ -2351,8 +3086,8 @@ echo "🔍 === FINAL CHECK: Ensuring nmtui functionality ==="
 echo "   Checking NetworkManager config file..."
 if grep -q "unmanaged-devices.*$ONBOARD_WIFI\|unmanaged-devices.*wlan0" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
     echo "   ⚠️  Found $ONBOARD_WIFI in unmanaged-devices! Removing..."
-    sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
-    sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=interface-name:$USB_WIFI/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
+    sudo sed -i "s/unmanaged-devices=.*wlan0.*/unmanaged-devices=$(nm_unmanaged_devices_value "$USB_WIFI")/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
+    sudo sed -i "s/unmanaged-devices=.*$ONBOARD_WIFI.*/unmanaged-devices=$(nm_unmanaged_devices_value "$USB_WIFI")/g" /etc/NetworkManager/NetworkManager.conf 2>/dev/null || true
     echo "   ✅ Config file fixed"
 fi
 
@@ -2364,7 +3099,7 @@ if [ -n "$NM_WLAN0_FINAL_CHECK" ] && ! echo "$NM_WLAN0_FINAL_CHECK" | grep -qE "
 else
     echo "⚠️  $ONBOARD_WIFI is NOT managed! Attempting aggressive fix..."
     
-    write_clean_nm_conf "$ONBOARD_WIFI" "$USB_WIFI"
+    write_clean_nm_conf "$ONBOARD_WIFI" "$USB_WIFI" "$ETH_INTERFACE"
     
     # Reload NetworkManager config
     sudo nmcli general reload 2>/dev/null || true
@@ -2410,7 +3145,7 @@ else
     echo "❌ FINAL: $ONBOARD_WIFI became unmanaged! Status: $(echo "$FINAL_FINAL_CHECK" | awk '{print $3}' || echo 'not found')"
     echo ""
     echo "🔧 LAST RESORT FIX - Running one more time..."
-    write_clean_nm_conf "$ONBOARD_WIFI" "$USB_WIFI"
+    write_clean_nm_conf "$ONBOARD_WIFI" "$USB_WIFI" "$ETH_INTERFACE"
     # Reload and set managed
     sudo nmcli general reload 2>/dev/null || true
     sleep 3
