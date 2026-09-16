@@ -2227,6 +2227,13 @@ ${ETH_NFT_INPUT_BLOCK}        # Allow Tailscale when it comes up
         type filter hook forward priority 0;
         policy accept;  # Permissive for now
 
+        # Clamp TCP MSS to the outgoing route's MTU. tailscale0 is 1280 bytes
+        # vs the clients' 1500, and without this clients that miss or ignore
+        # the ICMP frag-needed hint blackhole any full-size packet -- seen in
+        # practice as TLS/WebSocket upgrades (large auth headers) hanging on
+        # some devices while small transfers work fine.
+        tcp flags syn tcp option maxseg size set rt mtu
+
         # Forward only between access point and Tailscale (force all traffic through VPN)
         iifname "$USB_WIFI" oifname "tailscale0" accept
         iifname "tailscale0" oifname "$USB_WIFI" accept
@@ -2359,6 +2366,40 @@ sudo sed -i "s/\${AP_GATEWAY}/$AP_GATEWAY/g" /etc/systemd/system/usb-wifi-ap.ser
 
 sudo systemctl daemon-reload
 sudo systemctl enable usb-wifi-ap
+
+# --- Create service to assign the ethernet sharing IP on boot ---
+# The dhcpcd.conf fragment above only works on systems where dhcpcd manages the
+# network. On NetworkManager-based systems (Raspberry Pi OS Bookworm) the
+# ethernet interface is deliberately unmanaged, so nothing re-assigns
+# ETH_GATEWAY after a reboot -- the port comes up with no address, dnsmasq
+# can't serve DHCP on it, and wired SSH silently dies. Mirror what
+# usb-wifi-ap.service does for the AP: a oneshot that pins the address before
+# dnsmasq starts.
+if [ "$ETH_ENABLED" = true ]; then
+    echo "=== Creating ethernet sharing boot service ==="
+    sudo tee /etc/systemd/system/eth-share.service > /dev/null <<EOF
+[Unit]
+Description=Assign static IP to ethernet sharing interface
+Before=dnsmasq.service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'ip link set $ETH_INTERFACE up 2>/dev/null || true; ip addr replace ${ETH_GATEWAY}/24 dev $ETH_INTERFACE'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable eth-share
+    sudo systemctl start eth-share
+else
+    # Clean up if ethernet sharing was previously enabled and is now off
+    sudo systemctl disable eth-share 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/eth-share.service
+    sudo systemctl daemon-reload
+fi
 
 # --- Create watchdog service to monitor and auto-recover from disconnects ---
 echo "=== Creating connection watchdog service ==="
