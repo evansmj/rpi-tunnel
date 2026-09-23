@@ -1618,7 +1618,10 @@ fi
 # Check if dependencies are already installed
 echo "=== Checking dependencies ==="
 MISSING_DEPS=()
-for pkg in hostapd dnsmasq nftables curl wireless-tools; do
+# dnsutils provides nslookup, used to query 100.100.100.100 directly during the
+# DNS verification below. Without it that check cannot distinguish a working
+# Tailscale resolver from a working system resolver.
+for pkg in hostapd dnsmasq nftables curl wireless-tools dnsutils; do
     if ! dpkg -l | grep -q "^ii.*$pkg "; then
         MISSING_DEPS+=("$pkg")
     fi
@@ -2169,14 +2172,16 @@ if [ "$ETH_ENABLED" = true ]; then
     sudo ip addr add ${ETH_GATEWAY}/24 dev "$ETH_INTERFACE" 2>/dev/null || echo "IP address already assigned to $ETH_INTERFACE"
 fi
 
-# --- More permissive nftables rules ---
-echo "=== Configuring nftables (permissive for setup) ==="
+# --- nftables rules (client forwarding fails closed) ---
+echo "=== Configuring nftables (forward policy drop) ==="
 
 # Optional ethernet fragments. Note: no eth<->hotel-Wi-Fi forwarding rule is added
 # here -- only eth<->tailscale0 -- so the wired client fails closed exactly like the
 # AP does if the tunnel ever drops, instead of silently falling back to raw internet.
 ETH_NFT_INPUT_BLOCK=""
 ETH_NFT_FORWARD_BLOCK=""
+ETH_NFT_CT_BLOCK=""
+ETH_NFT_NAT_BLOCK=""
 if [ "$ETH_ENABLED" = true ]; then
     ETH_NFT_INPUT_BLOCK="        # Allow ethernet internet-sharing traffic
         iifname \"$ETH_INTERFACE\" accept
@@ -2184,6 +2189,11 @@ if [ "$ETH_ENABLED" = true ]; then
     ETH_NFT_FORWARD_BLOCK="        # Forward only between ethernet and Tailscale (force all traffic through VPN)
         iifname \"$ETH_INTERFACE\" oifname \"tailscale0\" accept
         iifname \"tailscale0\" oifname \"$ETH_INTERFACE\" accept
+"
+    ETH_NFT_CT_BLOCK="        ct state established,related iifname \"$ETH_INTERFACE\" oifname \"tailscale0\" accept
+        ct state established,related iifname \"tailscale0\" oifname \"$ETH_INTERFACE\" accept
+"
+    ETH_NFT_NAT_BLOCK="        ip saddr ${ETH_IP_RANGE}.0/24 oifname \"tailscale0\" masquerade
 "
 fi
 
@@ -2225,7 +2235,13 @@ ${ETH_NFT_INPUT_BLOCK}        # Allow Tailscale when it comes up
 
     chain forward {
         type filter hook forward priority 0;
-        policy accept;  # Permissive for now
+        # policy drop is the kill switch. The accept rules below are the ONLY
+        # paths out for a client, and every one of them requires tailscale0.
+        # If the tunnel drops, client packets are dropped here rather than
+        # being routed out the hotel uplink. This must stay "drop" -- with
+        # "accept" the rules below are decorative, because anything that does
+        # not match them is permitted by the policy anyway.
+        policy drop;
 
         # Clamp TCP MSS to the outgoing route's MTU. tailscale0 is 1280 bytes
         # vs the clients' 1500, and without this clients that miss or ignore
@@ -2234,6 +2250,14 @@ ${ETH_NFT_INPUT_BLOCK}        # Allow Tailscale when it comes up
         # some devices while small transfers work fine.
         tcp flags syn tcp option maxseg size set rt mtu
 
+        # Return traffic, scoped to the same interface pairs as the accept rules
+        # below. An unscoped "ct state established,related accept" would let any
+        # pre-existing conntrack entry through regardless of interface, so flows
+        # established under an older ruleset could keep bypassing these
+        # restrictions after the policy tightened.
+        ct state established,related iifname "$USB_WIFI" oifname "tailscale0" accept
+        ct state established,related iifname "tailscale0" oifname "$USB_WIFI" accept
+${ETH_NFT_CT_BLOCK}
         # Forward only between access point and Tailscale (force all traffic through VPN)
         iifname "$USB_WIFI" oifname "tailscale0" accept
         iifname "tailscale0" oifname "$USB_WIFI" accept
@@ -2253,10 +2277,12 @@ table ip nat {
     
     chain postrouting {
         type nat hook postrouting priority 100;
-        
-        # NAT traffic from access point only through Tailscale (force VPN)
-        oifname "tailscale0" masquerade
-    }
+
+        # NAT client traffic only, and only on the way out through Tailscale.
+        # Scoped by source subnet so this rule can never masquerade anything
+        # onto the hotel uplink even if a future rule opens that path.
+        ip saddr ${AP_IP_RANGE}.0/24 oifname "tailscale0" masquerade
+${ETH_NFT_NAT_BLOCK}    }
 }
 EOF
 
@@ -2277,6 +2303,124 @@ sudo iptables -t nat -X 2>/dev/null || true
 sudo nft -f /etc/nftables.conf
 sudo systemctl restart nftables
 
+# --- Tailscale exit node bring-up (shared by this script, boot, and watchdog) ---
+# One implementation of "get the tunnel into a known-good state, and only expose
+# the AP if it verifiably worked". Three callers used to each do their own thing:
+# tunnel.sh ran "tailscale up" and treated failure as a warning, the boot service
+# did the same, and the watchdog only retried "tailscale up" -- none of them did
+# the down/up reset that is what actually recovers a wedged tailscaled, and none
+# of them stopped the AP when verification failed, so clients stayed associated
+# to an access point with no working tunnel behind it.
+echo "=== Installing Tailscale exit-node bring-up script ==="
+sudo tee /usr/local/bin/tunnel-exit-up.sh > /dev/null <<EOF
+#!/bin/bash
+# Reset Tailscale into a known-good exit-node state and verify it before
+# allowing client traffic. Exits non-zero with the AP left stopped on failure.
+TAILSCALE_EXIT_NODE_IP="$TAILSCALE_EXIT_NODE_IP"
+TAILSCALE_EXIT_NODE_NAME="$TAILSCALE_EXIT_NODE_NAME"
+TAILSCALE_EXPECTED_IP="$TAILSCALE_EXPECTED_IP"
+AP_IP_RANGE="$AP_IP_RANGE"
+ETH_ENABLED="$ETH_ENABLED"
+ETH_IP_RANGE="$ETH_IP_RANGE"
+EOF
+
+sudo tee -a /usr/local/bin/tunnel-exit-up.sh > /dev/null <<'EOF'
+
+# Serialize every caller: this script is invoked manually by tunnel.sh, at boot
+# by tailscale-exit.service, and on failure by the watchdog. Those can overlap --
+# the watchdog is not ordered behind the boot service and polls every 30s -- and
+# two concurrent "tailscale down"/"up" sequences fight each other. Non-blocking,
+# so a second caller reports and leaves rather than queueing up another reset.
+exec 9>/run/tunnel-exit-up.lock
+if ! flock -n 9; then
+    echo "tunnel-exit-up: another bring-up is already running, skipping"
+    exit 0
+fi
+
+# Clients must never be able to associate while the tunnel is unverified, so
+# the AP goes down first and only comes back after the checks below pass.
+stop_ap() {
+    systemctl stop hostapd 2>/dev/null || true
+    systemctl stop dnsmasq 2>/dev/null || true
+}
+
+# Policy routing must exist BEFORE clients can associate. tailscale-routing.service
+# installs the same rules but is ordered after tailscale-exit.service and sleeps 5
+# first, so at boot the AP would otherwise come up in the gap and clients would be
+# routed by a table that has not been fixed up yet. Idempotent, so both can run.
+install_local_routing_rules() {
+    ip rule add from "${AP_IP_RANGE}.0/24" to "${AP_IP_RANGE}.0/24" table main priority 100 2>/dev/null || true
+    ip rule add to "${AP_IP_RANGE}.0/24" table main priority 50 2>/dev/null || true
+    if [ "$ETH_ENABLED" = "true" ]; then
+        ip rule add from "${ETH_IP_RANGE}.0/24" to "${ETH_IP_RANGE}.0/24" table main priority 100 2>/dev/null || true
+        ip rule add to "${ETH_IP_RANGE}.0/24" table main priority 50 2>/dev/null || true
+    fi
+}
+
+start_ap() {
+    install_local_routing_rules
+    systemctl start hostapd || return 1
+    systemctl start dnsmasq || return 1
+    return 0
+}
+
+# "tailscale up" on a running node only updates preferences -- it leaves the
+# engine, peer sessions and cached control state alone. A full down/up is what
+# restores service when that state is wedged, so always reset rather than
+# merely re-asserting prefs.
+reset_tailscale() {
+    tailscale down 2>/dev/null || true
+    sleep 2
+    timeout 30 tailscale up \
+        --exit-node="$TAILSCALE_EXIT_NODE_IP" \
+        --exit-node-allow-lan-access=false \
+        --accept-routes \
+        --accept-dns 2>&1
+}
+
+# Verification is deliberately end-to-end: "tailscale up" returning 0 does not
+# mean the exit node is carrying traffic. The egress IP check is the only one
+# that proves packets are leaving where they are supposed to.
+#
+# -4 because TAILSCALE_EXPECTED_IP is IPv4; without it the service can answer
+# with an IPv6 address and the comparison fails against a perfectly good tunnel.
+# https so the answer cannot be rewritten in transit by a captive portal, and
+# -fsS so an HTTP error page is a failure rather than a body to compare.
+verify_exit_node() {
+    local myip
+    tailscale status 2>/dev/null | grep -q "$TAILSCALE_EXIT_NODE_NAME.*active.*exit node" || return 1
+    myip=$(curl -4fsS --max-time 15 https://api.ipify.org 2>/dev/null) || return 1
+    [ -n "$myip" ] || return 1
+    [ "$myip" = "$TAILSCALE_EXPECTED_IP" ] || return 1
+    return 0
+}
+
+stop_ap
+reset_tailscale
+sleep 3
+
+for attempt in 1 2 3; do
+    if verify_exit_node; then
+        echo "tunnel-exit-up: exit node verified (egress $TAILSCALE_EXPECTED_IP)"
+        if start_ap; then
+            echo "tunnel-exit-up: AP services started"
+            exit 0
+        fi
+        echo "tunnel-exit-up: FAILED to start AP services"
+        stop_ap
+        exit 1
+    fi
+    echo "tunnel-exit-up: verification attempt $attempt failed, retrying..."
+    sleep 5
+done
+
+echo "tunnel-exit-up: FAILED to verify exit node; leaving AP stopped (fail closed)"
+stop_ap
+exit 1
+EOF
+
+sudo chmod +x /usr/local/bin/tunnel-exit-up.sh
+
 # --- Tailscale exit node service ---
 echo "=== Configuring Tailscale autoconnect ==="
 sudo tee /etc/systemd/system/tailscale-exit.service > /dev/null <<EOF
@@ -2287,16 +2431,29 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/tailscale up \\
-    --exit-node=$TAILSCALE_EXIT_NODE_IP \\
-    --exit-node-allow-lan-access=false \\
-    --accept-routes \\
-    --accept-dns
+ExecStart=/usr/local/bin/tunnel-exit-up.sh
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# Deliberately NO ordering drop-in on hostapd/dnsmasq.
+#
+# Both After= and Requires= deadlock here, for the same reason: tailscale-exit's
+# own ExecStart is tunnel-exit-up.sh, which calls "systemctl start hostapd" and
+# blocks until that job finishes. With any ordering on hostapd, that job waits
+# for tailscale-exit to leave "activating" -- which cannot happen until the call
+# it is blocked on returns. Ordering cycles deadlock just as dependency cycles do.
+#
+# The fail-closed mechanism does not need them: hostapd and dnsmasq are DISABLED,
+# so nothing starts them at boot except tunnel-exit-up.sh, and only after it has
+# verified the exit node. Remove any drop-in left by an earlier version.
+echo "=== Removing stale AP ordering drop-ins (they deadlock boot) ==="
+for ap_unit in hostapd dnsmasq; do
+    sudo rm -f "/etc/systemd/system/${ap_unit}.service.d/tunnel-order.conf"
+    sudo rmdir "/etc/systemd/system/${ap_unit}.service.d" 2>/dev/null || true
+done
 
 sudo systemctl daemon-reload
 sudo systemctl enable tailscale-exit
@@ -2418,6 +2575,7 @@ cat > /tmp/tunnel-watchdog.sh <<SCRIPTEOF
 HOTEL_WIFI="$HOTEL_WIFI"
 AP_WIFI="$AP_WIFI"
 TAILSCALE_EXIT_NODE_IP="$TAILSCALE_EXIT_NODE_IP"
+TAILSCALE_EXPECTED_IP="$TAILSCALE_EXPECTED_IP"
 ETH_ENABLED="$ETH_ENABLED"
 ETH_INTERFACE="$ETH_INTERFACE"
 ETH_GATEWAY="$ETH_GATEWAY"
@@ -2512,9 +2670,42 @@ while true; do
     fi
 
     # Check if Tailscale exit node is active
+    #
+    # This used to retry "tailscale up", which only re-asserts preferences and
+    # cannot recover a wedged tailscaled -- the watchdog would loop on that
+    # forever while the AP stayed up with no tunnel behind it. Delegate to the
+    # shared bring-up script instead: it stops the AP, does a full down/up
+    # reset, verifies egress, and only brings the AP back if that succeeded.
+    WD_NEEDS_RESET=false
     if ! tailscale status 2>/dev/null | grep -q "active.*exit node"; then
-        echo "[Watchdog] Tailscale exit node not active, reconnecting..."
-        tailscale up --exit-node="\$TAILSCALE_EXIT_NODE_IP" --exit-node-allow-lan-access=false --accept-routes --accept-dns 2>/dev/null || true
+        echo "[Watchdog] Tailscale exit node not active"
+        WD_NEEDS_RESET=true
+    else
+        # "active exit node" only means Tailscale believes the peer is selected.
+        # That was true throughout the outage this watchdog failed to catch: the
+        # session was up and passing bulk traffic while DNS and the control
+        # connection were dead. Periodically confirm egress actually leaves via
+        # the exit node, so an active-but-broken tunnel still triggers a reset.
+        # Throttled to roughly every 10th loop (~5 min) to avoid hammering the
+        # check service on a healthy system.
+        WD_EGRESS_COUNTER=\$(( \${WD_EGRESS_COUNTER:-0} + 1 ))
+        if [ "\$WD_EGRESS_COUNTER" -ge 10 ]; then
+            WD_EGRESS_COUNTER=0
+            WD_EGRESS_IP=\$(curl -4fsS --max-time 15 https://api.ipify.org 2>/dev/null || echo "")
+            if [ -n "\$WD_EGRESS_IP" ] && [ "\$WD_EGRESS_IP" != "\$TAILSCALE_EXPECTED_IP" ]; then
+                echo "[Watchdog] Egress is \$WD_EGRESS_IP, expected \$TAILSCALE_EXPECTED_IP - tunnel is not carrying traffic"
+                WD_NEEDS_RESET=true
+            fi
+        fi
+    fi
+
+    if [ "\$WD_NEEDS_RESET" = true ]; then
+        echo "[Watchdog] Resetting tunnel..."
+        if /usr/local/bin/tunnel-exit-up.sh; then
+            echo "[Watchdog] Tunnel restored and verified"
+        else
+            echo "[Watchdog] Tunnel reset FAILED - AP left stopped (fail closed)"
+        fi
         sleep 5
     fi
 
@@ -2637,7 +2828,15 @@ while true; do
 
     # ==========================================================================
     # ACCESS POINT MONITORING - Check if AP (wlan1) is healthy
+    #
+    # Every restart below is gated on the exit node being active. Without that
+    # gate this section defeats the whole fail-closed design: tunnel-exit-up.sh
+    # stops the AP when verification fails, and 30 seconds later the watchdog
+    # would notice hostapd "is not running" and start it straight back up --
+    # exposing an access point with no tunnel behind it, which is exactly the
+    # state the drop policy and verification exist to prevent.
     # ==========================================================================
+    if tailscale status 2>/dev/null | grep -q "active.*exit node"; then
 
     # Check if AP interface has an IP address
     if ! ip addr show "\$AP_WIFI" 2>/dev/null | grep -q "inet "; then
@@ -2653,8 +2852,11 @@ while true; do
         if ip addr show "\$AP_WIFI" 2>/dev/null | grep -q "inet "; then
             echo "[Watchdog] AP interface \$AP_WIFI recovered successfully"
         else
+            # Use the configured gateway, not a hardcoded address. This was
+            # 10.0.50.1/24 regardless of AP_GATEWAY, so on any other AP subnet
+            # the "recovery" assigned an address no client could route to.
             echo "[Watchdog] AP recovery failed - manually assigning IP..."
-            ip addr add 10.0.50.1/24 dev "\$AP_WIFI" 2>/dev/null || true
+            ip addr add ${AP_GATEWAY}/24 dev "\$AP_WIFI" 2>/dev/null || true
             systemctl restart hostapd 2>/dev/null || true
             systemctl restart dnsmasq 2>/dev/null || true
         fi
@@ -2674,6 +2876,10 @@ while true; do
     if ! systemctl is-active --quiet dnsmasq 2>/dev/null; then
         echo "[Watchdog] dnsmasq is not running - restarting..."
         systemctl restart dnsmasq 2>/dev/null || true
+    fi
+
+    else
+        echo "[Watchdog] Exit node not active - leaving AP services stopped (fail closed)"
     fi
 
     # ==========================================================================
@@ -2704,7 +2910,13 @@ fi
 sudo tee /etc/systemd/system/tunnel-watchdog.service > /dev/null <<'SERVICEEOF'
 [Unit]
 Description=Tunnel Connection Watchdog - Auto-recover from disconnects
-After=network-online.target tailscaled.service hostapd.service
+# After=tailscale-exit.service so the watchdog cannot start polling, decide the
+# exit node is down and launch its own tunnel-exit-up.sh while the boot service
+# is still running that very script. (The flock inside the script is the real
+# guard; this just avoids the race in the common case.) hostapd is disabled and
+# never part of the boot transaction, so ordering after it is inert -- keeping
+# it only to preserve behavior if it is ever re-enabled.
+After=network-online.target tailscaled.service hostapd.service tailscale-exit.service
 Wants=network-online.target
 
 [Service]
@@ -2728,13 +2940,27 @@ fi
 sudo systemctl daemon-reload
 sudo systemctl enable tunnel-watchdog
 
-# --- Enable and start services ---
-echo "=== Enabling and starting AP services ==="
+# --- Enable services (AP stays STOPPED until the tunnel verifies) ---
+# The AP deliberately does not start here. hostapd used to start at this point,
+# minutes before "tailscale up" ran, so clients could associate and be forwarded
+# while no tunnel existed. The decision to expose the AP now belongs solely to
+# the verification step below.
+#
+# hostapd and dnsmasq are unmasked but DISABLED. Disabling is the boot-time kill
+# switch: the only thing that starts them is tunnel-exit-up.sh, after it has
+# verified the exit node. If verification fails at boot, or tailscale-exit.service
+# never runs at all, the AP simply never comes up rather than coming up without a
+# tunnel behind it.
+echo "=== Preparing AP services (disabled until the tunnel verifies) ==="
 sudo systemctl unmask hostapd
-sudo systemctl enable hostapd
-sudo systemctl enable dnsmasq
+sudo systemctl disable hostapd 2>/dev/null || true
+sudo systemctl disable dnsmasq 2>/dev/null || true
+sudo systemctl stop hostapd 2>/dev/null || true
+sudo systemctl stop dnsmasq 2>/dev/null || true
 
-# Start the services
+# Prepare the interfaces. usb-wifi-ap only sets interface mode and address --
+# without hostapd nothing can associate, so this is safe to do before the
+# tunnel is verified.
 ensure_nm_wlan0_managed  # Ensure config is correct before restart
 sudo systemctl restart NetworkManager
 force_wlan0_managed_after_restart  # Force wlan0 to stay managed after restart
@@ -2742,23 +2968,6 @@ force_wlan0_managed_after_restart  # Force wlan0 to stay managed after restart
 sudo nmcli device set $ONBOARD_WIFI managed yes 2>/dev/null || true
 sudo nmcli device set $USB_WIFI managed no 2>/dev/null || true
 sudo systemctl start usb-wifi-ap
-sudo systemctl start hostapd
-# hostapd may reset driver power state while bringing up the AP. Apply once more
-# after startup and report the actual state instead of assuming success.
-sudo iw dev "$AP_WIFI" set power_save off 2>/dev/null || true
-AP_POWER_SAVE_AFTER_START=$(iw dev "$AP_WIFI" get power_save 2>/dev/null | awk '{print $3}' || echo "unknown")
-if [ "$AP_POWER_SAVE_AFTER_START" = "off" ]; then
-    echo "✅ AP Wi-Fi power save is off"
-else
-    echo "⚠️  $AP_WIFI driver reports power save '$AP_POWER_SAVE_AFTER_START' in AP mode"
-fi
-sudo systemctl start dnsmasq
-sudo systemctl start tunnel-watchdog
-
-# Check service status
-echo "=== Service Status ==="
-sudo systemctl --no-pager status hostapd
-sudo systemctl --no-pager status dnsmasq
 
 # --- Configure Tailscale routing ---
 echo "=== Configuring Tailscale routing ==="
@@ -2770,28 +2979,11 @@ if ! sudo tailscale ip -4 >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "Tailscale is authenticated. Configuring exit node and routing..."
-echo "   Attempting to connect to exit node: $TAILSCALE_EXIT_NODE_IP"
-echo "   (This may take up to 30 seconds if the exit node is not immediately reachable)..."
+echo "Tailscale is authenticated. Preparing routing before tunnel bring-up..."
 
-# Use timeout to prevent hanging indefinitely (30 seconds should be enough)
-# Also redirect stderr to capture any errors
-if timeout 30 sudo tailscale up --exit-node=$TAILSCALE_EXIT_NODE_IP --exit-node-allow-lan-access=false --accept-routes --accept-dns 2>&1; then
-    echo "   ✅ Tailscale exit node connection command completed"
-else
-    EXIT_CODE=$?
-    if [ $EXIT_CODE -eq 124 ]; then
-        echo "   ⚠️  WARNING: tailscale up command timed out after 30 seconds"
-        echo "   💡 This usually means the exit node is not reachable or there's a network issue"
-        echo "   💡 The connection may still work - checking status..."
-    else
-        echo "   ⚠️  WARNING: tailscale up command failed with exit code $EXIT_CODE"
-        echo "   💡 This may be normal if the exit node is not immediately available"
-        echo "   💡 Checking current Tailscale status..."
-    fi
-fi
-
-sleep 3
+# Routing policy is installed BEFORE the tunnel comes up and before the AP is
+# exposed, so there is no window where a client can associate and be routed by
+# a half-configured table.
 
 # Remove any existing incomplete Tailscale routes
 sudo ip route del default dev tailscale0 2>/dev/null || true
@@ -2822,16 +3014,53 @@ fi
 # Let Tailscale handle its own routing when using exit nodes
 echo "✅ Letting Tailscale manage exit node routing automatically"
 
-# Check if exit node is actually active (may not be if connection failed)
+# --- Bring up and VERIFY the tunnel; the AP is exposed only if this passes ---
+# This replaces the old "run tailscale up, print a warning if it fails, carry on"
+# path. That path is how the Pi came up with a broken tunnel and still reported
+# success -- and because it only ever ran "tailscale up", it could not recover a
+# wedged tailscaled even on a re-run. The shared script does a full down/up reset,
+# verifies egress actually leaves via the exit node, and starts hostapd/dnsmasq
+# only on success.
 echo ""
-echo "Verifying exit node connection..."
-if sudo tailscale status 2>/dev/null | grep -q "$TAILSCALE_EXIT_NODE_NAME.*active.*exit node"; then
-    echo "   ✅ Exit node is active and connected!"
+echo "=== Bringing up and verifying exit node ==="
+echo "   Exit node: $TAILSCALE_EXIT_NODE_NAME ($TAILSCALE_EXIT_NODE_IP)"
+echo "   (resetting Tailscale and verifying egress; this may take a minute)..."
+
+if sudo /usr/local/bin/tunnel-exit-up.sh; then
+    echo "   ✅ Exit node verified and AP services started"
 else
-    echo "   ⚠️  Exit node is not yet active (this is normal if network is still connecting)"
-    echo "   💡 The exit node will connect automatically when network is available"
-    echo "   💡 You can check status later with: sudo tailscale status"
+    echo ""
+    echo "❌ EXITING: exit node could not be verified"
+    echo "   The access point has been left STOPPED on purpose (fail closed)."
+    echo "   Clients cannot associate, so nothing can leak out the local uplink."
+    echo ""
+    echo "   🔍 Current Tailscale status:"
+    sudo tailscale status 2>&1 | head -10 || true
+    echo ""
+    echo "   💡 Check: exit node '$TAILSCALE_EXIT_NODE_NAME' is online and advertising"
+    echo "   💡 Check: uplink quality with 'ping -c 50 1.1.1.1' (loss above a few %"
+    echo "      will break the control connection before anything else)"
+    echo "   💡 Re-run this script once the uplink or exit node is healthy"
+    exit 1
 fi
+
+# The watchdog starts only after a verified tunnel, so it can never be the thing
+# that brings the AP up on an unverified one.
+sudo systemctl start tunnel-watchdog
+
+# hostapd may reset driver power state while bringing up the AP. Apply once more
+# after startup and report the actual state instead of assuming success.
+sudo iw dev "$AP_WIFI" set power_save off 2>/dev/null || true
+AP_POWER_SAVE_AFTER_START=$(iw dev "$AP_WIFI" get power_save 2>/dev/null | awk '{print $3}' || echo "unknown")
+if [ "$AP_POWER_SAVE_AFTER_START" = "off" ]; then
+    echo "✅ AP Wi-Fi power save is off"
+else
+    echo "⚠️  $AP_WIFI driver reports power save '$AP_POWER_SAVE_AFTER_START' in AP mode"
+fi
+
+echo "=== Service Status ==="
+sudo systemctl --no-pager status hostapd
+sudo systemctl --no-pager status dnsmasq
 
 # Verify DNS is properly configured
 echo ""
@@ -2869,13 +3098,41 @@ else
         echo "❌ Failed to write Tailscale DNS to resolv.conf"
     fi
     
-    # Verify DNS actually resolves through Tailscale
-    sleep 1
-    if ping -c 1 -W 3 google.com >/dev/null 2>&1; then
-        echo "✅ DNS resolution working through Tailscale"
-    else
-        echo "⚠️  DNS resolution not working yet (Tailscale DNS may need a moment)"
+fi
+
+# Verify DNS actually resolves, in BOTH branches above. This used to only run in
+# the "had to force it" branch, and only printed a warning before continuing --
+# so a Pi whose resolv.conf looked right but resolved nothing was reported as a
+# successful setup. Query 100.100.100.100 directly rather than pinging a name,
+# so a working system resolver cannot mask a broken Tailscale one.
+echo "   Checking that Tailscale DNS actually resolves..."
+DNS_OK=false
+for dns_attempt in 1 2 3; do
+    if timeout 5 nslookup google.com 100.100.100.100 >/dev/null 2>&1; then
+        DNS_OK=true
+        break
     fi
+    sleep 3
+done
+
+if [ "$DNS_OK" = true ]; then
+    echo "✅ DNS resolution working through Tailscale"
+else
+    echo ""
+    echo "❌ EXITING: Tailscale DNS (100.100.100.100) is not resolving"
+    echo "   Stopping the access point (fail closed) so clients cannot associate"
+    echo "   to an AP whose DNS is dead or would resolve outside the tunnel."
+    sudo systemctl stop hostapd 2>/dev/null || true
+    sudo systemctl stop dnsmasq 2>/dev/null || true
+    echo ""
+    echo "   🔍 Tailscale DNS status:"
+    sudo tailscale dns status 2>&1 | head -20 || true
+    echo ""
+    echo "   💡 If 'Resolvers' shows none configured, add a global nameserver in the"
+    echo "      Tailscale admin console (DNS page) so 100.100.100.100 has an upstream."
+    echo "   💡 If the exit node is the resolver, confirm its own DNS is healthy --"
+    echo "      it can forward packets fine while failing to answer DNS queries."
+    exit 1
 fi
 
 echo "✅ Tailscale routing configured"
