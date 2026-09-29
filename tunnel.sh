@@ -2121,7 +2121,11 @@ dhcp-option=tag:ap,6,$AP_GATEWAY
 # queries leak to the local ISP even though the exit node is working.
 no-resolv
 server=${TAILSCALE_DNS:-100.100.100.100}
-log-queries
+# NOTE: log-queries is deliberately NOT enabled. It records every domain every
+# connected device resolves -- a plaintext browsing history sitting on the Pi's
+# SD card, and by far the largest write source on the system if the journal is
+# ever made persistent. log-dhcp is a few lines per client per lease and is
+# what actually helps when a device fails to get an address.
 log-dhcp
 ${ETH_DNSMASQ_BLOCK}
 EOF
@@ -2287,9 +2291,42 @@ ${ETH_NFT_NAT_BLOCK}    }
 EOF
 
 # Enable IP forwarding
+#
+# Without this the Pi answers pings on $AP_GATEWAY and serves DNS -- both of
+# which terminate ON the Pi -- while silently routing nothing. Clients
+# associate, take a DHCP lease, and then time out on every external
+# destination, with the tunnel, nftables and table 52 all perfectly healthy.
+# It is the single least visible way for this box to be broken.
+#
+# This used to be "tee -a /etc/sysctl.conf" + "sysctl -p", which had two
+# problems: it appended a duplicate line on every run, and /etc/sysctl.conf is
+# not the only thing applied at boot -- a later-sorting file under
+# /etc/sysctl.d can silently override it. Own a dedicated drop-in instead, so
+# there is exactly one place this value is declared and it sorts last.
 echo "=== Enabling IP forwarding ==="
-echo 'net.ipv4.ip_forward=1' | sudo tee -a /etc/sysctl.conf
-sudo sysctl -p
+
+# Remove duplicate lines this script appended in earlier versions, so the
+# drop-in below is the only declaration left.
+if [ -f /etc/sysctl.conf ] && grep -q '^net\.ipv4\.ip_forward=1$' /etc/sysctl.conf; then
+    sudo sed -i '/^net\.ipv4\.ip_forward=1$/d' /etc/sysctl.conf
+    echo "   Cleaned stale ip_forward lines from /etc/sysctl.conf"
+fi
+
+sudo tee /etc/sysctl.d/99-tunnel-forwarding.conf > /dev/null <<'SYSCTLEOF'
+# Managed by tunnel.sh -- required for the Pi to route client traffic into the
+# Tailscale tunnel. Without it clients get a lease and no connectivity.
+net.ipv4.ip_forward=1
+SYSCTLEOF
+
+sudo sysctl --system >/dev/null 2>&1 || sudo sysctl -p /etc/sysctl.d/99-tunnel-forwarding.conf >/dev/null 2>&1 || true
+sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+
+IP_FORWARD_NOW=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "?")
+if [ "$IP_FORWARD_NOW" = "1" ]; then
+    echo "   ✅ IP forwarding enabled (persisted in /etc/sysctl.d/99-tunnel-forwarding.conf)"
+else
+    echo "   ❌ IP forwarding is still $IP_FORWARD_NOW - clients will get a lease but no internet"
+fi
 
 # Load nftables rules (no safety timer for now - rules are permissive)
 echo "=== Loading nftables rules ==="
@@ -2322,6 +2359,7 @@ TAILSCALE_EXPECTED_IP="$TAILSCALE_EXPECTED_IP"
 AP_IP_RANGE="$AP_IP_RANGE"
 ETH_ENABLED="$ETH_ENABLED"
 ETH_IP_RANGE="$ETH_IP_RANGE"
+VERIFIED_STAMP=/run/tunnel-last-verified
 EOF
 
 sudo tee -a /usr/local/bin/tunnel-exit-up.sh > /dev/null <<'EOF'
@@ -2331,10 +2369,21 @@ sudo tee -a /usr/local/bin/tunnel-exit-up.sh > /dev/null <<'EOF'
 # the watchdog is not ordered behind the boot service and polls every 30s -- and
 # two concurrent "tailscale down"/"up" sequences fight each other. Non-blocking,
 # so a second caller reports and leaves rather than queueing up another reset.
+# Every line this script emits lands in /var/log/tunnel.log alongside the
+# watchdog's. systemd's StandardOutput=append: writes raw stdout with no
+# timestamps of its own, so reconstructing an outage previously meant
+# correlating against the systemd journal by hand. Stamp them here.
+log() {
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
 exec 9>/run/tunnel-exit-up.lock
 if ! flock -n 9; then
-    echo "tunnel-exit-up: another bring-up is already running, skipping"
-    exit 0
+    log "tunnel-exit-up: another bring-up is already running, skipping"
+    # Distinct from success: callers must not treat a skipped run as proof that
+    # egress was verified. EX_TEMPFAIL (75) tells the watchdog another caller
+    # owns the attempt without falsely refreshing the verification timestamp.
+    exit 75
 fi
 
 # Clients must never be able to associate while the tunnel is unverified, so
@@ -2344,11 +2393,24 @@ stop_ap() {
     systemctl stop dnsmasq 2>/dev/null || true
 }
 
+clear_verified() {
+    rm -f "$VERIFIED_STAMP"
+}
+
+mark_verified() {
+    local tmp="${VERIFIED_STAMP}.tmp.$$"
+    date +%s > "$tmp" && mv -f "$tmp" "$VERIFIED_STAMP"
+}
+
 # Policy routing must exist BEFORE clients can associate. tailscale-routing.service
 # installs the same rules but is ordered after tailscale-exit.service and sleeps 5
 # first, so at boot the AP would otherwise come up in the gap and clients would be
 # routed by a table that has not been fixed up yet. Idempotent, so both can run.
 install_local_routing_rules() {
+    # Table 52 and the nftables rules are inert if the kernel is not forwarding,
+    # and a boot-time sysctl can lose to a later-sorting drop-in. Assert it here,
+    # before the AP is ever exposed -- cheap and idempotent.
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
     ip rule add from "${AP_IP_RANGE}.0/24" to "${AP_IP_RANGE}.0/24" table main priority 100 2>/dev/null || true
     ip rule add to "${AP_IP_RANGE}.0/24" table main priority 50 2>/dev/null || true
     if [ "$ETH_ENABLED" = "true" ]; then
@@ -2362,6 +2424,55 @@ start_ap() {
     systemctl start hostapd || return 1
     systemctl start dnsmasq || return 1
     return 0
+}
+
+# At boot this script runs After=network-online.target, which NetworkManager
+# reaches as soon as SOME device is configured -- it does NOT wait for the hotel
+# Wi-Fi to associate, complete DHCP, and clear a captive portal. The three
+# verification attempts below span only ~20s, so after a power cut the tunnel
+# reliably failed to verify, the AP was left stopped, and (Type=oneshot) nothing
+# ever retried. Wait for real upstream connectivity first instead.
+#
+# Same ICMP-hostile rationale as check_internet() in tunnel.sh: hotel gateways
+# rate-limit or drop ping while TCP works fine, so never trust ping alone.
+wait_for_internet() {
+    local deadline=$(( $(date +%s) + ${TUNNEL_BOOT_WAIT:-120} ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && return 0
+        timeout 3 bash -c '>/dev/tcp/8.8.8.8/53' 2>/dev/null && return 0
+        timeout 3 bash -c '>/dev/tcp/1.1.1.1/443' 2>/dev/null && return 0
+        sleep 5
+    done
+    return 1
+}
+
+# Upstream reachability is NOT the same as a usable tunnel. After the hotel
+# network changes the Pi's address, raw internet comes back within seconds while
+# tailscaled still needs to re-establish its control connection and pull a fresh
+# network map -- measured at ~85s in the outage this was written for. The old
+# flow waited only for wait_for_internet, then spent all three verification
+# attempts inside that window, where failure was guaranteed.
+#
+# We cannot probe controlplane.tailscale.com ourselves: while the tunnel is down
+# /etc/resolv.conf still points at MagicDNS (100.100.100.100), so resolution
+# fails even on a perfectly healthy network. tailscaled has its own bootstrap
+# DNS and is the only component that can answer this, so ask it.
+control_plane_ready() {
+    ! tailscale status 2>&1 | grep -q "coordination server"
+}
+
+wait_for_control_plane() {
+    local deadline=$(( $(date +%s) + ${TUNNEL_CONTROL_WAIT:-120} ))
+    control_plane_ready && return 0
+    log "tunnel-exit-up: tailscaled has no network map yet, waiting up to ${TUNNEL_CONTROL_WAIT:-120}s..."
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        sleep 5
+        if control_plane_ready; then
+            log "tunnel-exit-up: control connection re-established"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # "tailscale up" on a running node only updates preferences -- it leaves the
@@ -2395,26 +2506,54 @@ verify_exit_node() {
     return 0
 }
 
+clear_verified
 stop_ap
+
+# Drop any stale exit-node preference BEFORE probing raw internet. tailscaled
+# starts at boot with the prefs from last time, so without this the probe below
+# would be blackholed by the very tunnel we are trying to rebuild.
+tailscale down 2>/dev/null || true
+sleep 2
+
+if ! wait_for_internet; then
+    log "tunnel-exit-up: no upstream internet after ${TUNNEL_BOOT_WAIT:-120}s; leaving AP stopped (fail closed)"
+    stop_ap
+    exit 1
+fi
+
+# Not fatal on timeout: "tailscale up" below can itself provoke the reconnect,
+# and the verification loop is now long enough to cover a slow one. Proceeding
+# with a warning beats refusing to try.
+wait_for_control_plane || log "tunnel-exit-up: still no network map; attempting bring-up anyway"
+
 reset_tailscale
 sleep 3
 
-for attempt in 1 2 3; do
+# Six attempts at 10s, not three at 5s. The old ~20s budget was shorter than a
+# routine control-plane reconnect, so a tunnel that was merely slow to come back
+# was reported as failed -- the AP was left closed and the watchdog re-entered
+# this same script on its next loop, repeating the too-short wait.
+for attempt in 1 2 3 4 5 6; do
     if verify_exit_node; then
-        echo "tunnel-exit-up: exit node verified (egress $TAILSCALE_EXPECTED_IP)"
+        log "tunnel-exit-up: exit node verified (egress $TAILSCALE_EXPECTED_IP)"
         if start_ap; then
-            echo "tunnel-exit-up: AP services started"
-            exit 0
+            if mark_verified; then
+                log "tunnel-exit-up: AP services started"
+                exit 0
+            fi
+            log "tunnel-exit-up: FAILED to publish verification proof"
+        else
+            log "tunnel-exit-up: FAILED to start AP services"
         fi
-        echo "tunnel-exit-up: FAILED to start AP services"
+        clear_verified
         stop_ap
         exit 1
     fi
-    echo "tunnel-exit-up: verification attempt $attempt failed, retrying..."
-    sleep 5
+    log "tunnel-exit-up: verification attempt $attempt failed, retrying..."
+    sleep 10
 done
 
-echo "tunnel-exit-up: FAILED to verify exit node; leaving AP stopped (fail closed)"
+log "tunnel-exit-up: FAILED to verify exit node; leaving AP stopped (fail closed)"
 stop_ap
 exit 1
 EOF
@@ -2429,6 +2568,12 @@ Description=Force Tailscale to use exit node '$TAILSCALE_EXIT_NODE_NAME'
 After=network-online.target tailscaled.service
 Wants=network-online.target
 
+# NOTE: no Restart= here -- systemd rejects Restart= on Type=oneshot units. The
+# retry path is twofold instead: tunnel-exit-up.sh now waits up to
+# TUNNEL_BOOT_WAIT (120s) for real upstream connectivity before it even tries,
+# which covers slow hotel DHCP and captive portals after a power cut; and the
+# watchdog re-runs the same script within 30s of any failure, guarded by the
+# flock inside it.
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/tunnel-exit-up.sh
@@ -2580,7 +2725,87 @@ ETH_ENABLED="$ETH_ENABLED"
 ETH_INTERFACE="$ETH_INTERFACE"
 ETH_GATEWAY="$ETH_GATEWAY"
 GATEWAY_AUTOFIX="$GATEWAY_AUTOFIX"
+AP_IP_RANGE="$AP_IP_RANGE"
+AP_GATEWAY="$AP_GATEWAY"
+ETH_IP_RANGE="$ETH_IP_RANGE"
 AP_POWER_SAVE_WARNING_REPORTED=false
+
+# --- Egress verification state -------------------------------------------
+# Shared, reboot-scoped proof written by tunnel-exit-up.sh and this watchdog.
+# /run is cleared at boot, so proof can survive service restarts but can never
+# be inherited from an earlier boot or machine state.
+WD_VERIFIED_STAMP=/run/tunnel-last-verified
+# WD_LAST_VERIFIED is the epoch of the last time egress was PROVEN to leave via
+# the exit node. Initialize it from the shared stamp so a watchdog restart
+# inherits a successful boot-time verification instead of taking down a healthy
+# AP merely because its first ipify request times out.
+WD_LAST_VERIFIED=0
+WD_STAMP_VALUE=\$(cat "\$WD_VERIFIED_STAMP" 2>/dev/null || true)
+case "\$WD_STAMP_VALUE" in
+    ''|*[!0-9]*) ;;
+    *) WD_LAST_VERIFIED=\$WD_STAMP_VALUE ;;
+esac
+WD_LAST_EGRESS_CHECK=0
+WD_EGRESS_FAIL_STREAK=0
+# How stale a verification may be before the AP is considered unsafe to run.
+# Must exceed WD_EGRESS_INTERVAL_OK so a healthy system always re-verifies with
+# room to spare.
+WD_VERIFY_MAX_AGE=600
+# Check egress every 5 min when healthy, every minute once a check has failed --
+# a suspected outage deserves faster confirmation than a working tunnel does.
+WD_EGRESS_INTERVAL_OK=300
+WD_EGRESS_INTERVAL_BAD=60
+
+# systemd's StandardOutput=append: writes raw stdout with no timestamps, so the
+# log was a bare list of messages with no way to tell whether two lines were
+# seconds or days apart. Reconstructing an outage meant cross-referencing the
+# systemd journal by hand. Stamp every line here instead.
+wd_log() {
+    printf '%s %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" "\$*"
+}
+
+# A dead tunnel and a tunnel 40 seconds into a routine reconnect look identical
+# to an egress check: both return nothing. Resetting is right for the first and
+# actively harmful for the second -- tunnel-exit-up.sh opens with "tailscale
+# down", which tears up a recovery already in progress. Track how long the
+# control connection has been missing so a reset only fires once tailscaled has
+# had a fair chance to fix itself. The AP is not at risk during the grace
+# period: WD_VERIFY_MAX_AGE still ages out the verification proof and closes it.
+WD_RECONNECT_SINCE=0
+WD_RECONNECT_GRACE=240
+
+# True while tailscaled reports it is out of contact with the coordination
+# server -- the state it enters after the hotel network changes the Pi's
+# address, and the state it recovers from on its own via bootstrap DNS.
+wd_control_reconnecting() {
+    tailscale status 2>&1 | grep -q "coordination server"
+}
+
+wd_mark_verified() {
+    local verified_at tmp
+    verified_at=\$(date +%s)
+    tmp="\${WD_VERIFIED_STAMP}.tmp.\$\$"
+    if printf '%s\n' "\$verified_at" > "\$tmp" && mv -f "\$tmp" "\$WD_VERIFIED_STAMP"; then
+        WD_LAST_VERIFIED=\$verified_at
+    else
+        rm -f "\$tmp"
+        WD_LAST_VERIFIED=0
+    fi
+}
+
+wd_clear_verified() {
+    rm -f "\$WD_VERIFIED_STAMP"
+    WD_LAST_VERIFIED=0
+}
+
+wd_read_verified() {
+    local value
+    value=\$(cat "\$WD_VERIFIED_STAMP" 2>/dev/null || true)
+    case "\$value" in
+        ''|*[!0-9]*) WD_LAST_VERIFIED=0 ;;
+        *) WD_LAST_VERIFIED=\$value ;;
+    esac
+}
 
 # Same rationale as check_internet() in tunnel.sh: ICMP-hostile gateways and
 # Wi-Fi power save against a long-beacon-interval AP can make ping unreliable
@@ -2593,12 +2818,139 @@ wd_check_internet() {
     return 1
 }
 
+# =========================================================================
+# CLIENT FORWARDING PATH PROBE
+#
+# Every other check in this watchdog verifies something that terminates ON
+# the Pi: the hotel link, tailscaled's own egress, hostapd, dnsmasq. All of
+# them can pass while clients reach nothing at all -- observed twice, once
+# with net.ipv4.ip_forward=0, where the Pi answered pings on \$AP_GATEWAY and
+# served DNS (both terminate locally) while silently routing nothing.
+#
+# The same blind spot covers a flushed nftables ruleset, a missing "ip rule",
+# and an empty table 52. Rather than add a check per cause, ask the kernel the
+# question a client packet asks: given a packet from the AP subnet arriving on
+# the AP interface, bound for the internet, where does it go? "ip route get
+# ... iif" performs the real forwarding lookup -- policy rules, table 52 and
+# all -- without a client and without emitting a packet.
+#
+# Prints a space-separated list of problems, empty when the path is sound.
+# =========================================================================
+wd_client_path_problems() {
+    local problems=""
+    local fwd
+
+    # 1. The kernel must actually be willing to forward.
+    if [ "\$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]; then
+        problems="\$problems ip_forward=0"
+    fi
+
+    # 2. The forwarding decision itself: a client packet must leave via
+    #    tailscale0. Catches missing ip rules AND an empty table 52 in one go.
+    fwd=\$(ip route get 1.1.1.1 from \$AP_IP_RANGE.2 iif \$AP_WIFI 2>&1)
+    if ! echo "\$fwd" | grep -q "dev tailscale0"; then
+        problems="\$problems ap-not-routed-via-tunnel"
+    fi
+
+    # 3. Table 52 must carry the exit-node default route.
+    if ! ip route show table 52 2>/dev/null | grep -q "^default dev tailscale0"; then
+        problems="\$problems table52-no-default"
+    fi
+
+    # 4. The forward chain must still permit AP -> tunnel. A flushed ruleset
+    #    leaves policy drop with nothing to match, which looks identical to a
+    #    routing failure from a client's seat.
+    #    The '.' in the patterns matches nft's quote characters.
+    if ! nft list chain inet filter forward 2>/dev/null \
+        | grep -qE "iifname .\$AP_WIFI. oifname .tailscale0. accept"; then
+        problems="\$problems nft-forward-rule-missing"
+    fi
+
+    # 5. Without the masquerade rule client packets leave with a 10.x source
+    #    and no reply can ever come back.
+    if ! nft list table ip nat 2>/dev/null \
+        | grep -qE "ip saddr \$AP_IP_RANGE\.0/24 oifname .tailscale0. masquerade"; then
+        problems="\$problems nft-nat-rule-missing"
+    fi
+
+    if [ "\$ETH_ENABLED" = "true" ]; then
+        fwd=\$(ip route get 1.1.1.1 from \$ETH_IP_RANGE.2 iif \$ETH_INTERFACE 2>&1)
+        if ! echo "\$fwd" | grep -q "dev tailscale0"; then
+            problems="\$problems eth-not-routed-via-tunnel"
+        fi
+        if ! nft list chain inet filter forward 2>/dev/null \
+            | grep -qE "iifname .\$ETH_INTERFACE. oifname .tailscale0. accept"; then
+            problems="\$problems nft-eth-forward-rule-missing"
+        fi
+        if ! nft list table ip nat 2>/dev/null \
+            | grep -qE "ip saddr \$ETH_IP_RANGE\.0/24 oifname .tailscale0. masquerade"; then
+            problems="\$problems nft-eth-nat-rule-missing"
+        fi
+    fi
+
+    echo "\$problems"
+}
+
+# Cheap, targeted in-place repairs for everything the probe can detect.
+# Deliberately does NOT reset tailscaled: tearing the tunnel down drops every
+# client, so it is a last resort the caller escalates to only if these fail.
+wd_repair_client_path() {
+    local problems=" \$1 "
+
+    case "\$problems" in
+        *" ip_forward=0 "*)
+            sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+            ;;
+    esac
+
+    case "\$problems" in
+        *" ap-not-routed-via-tunnel "*|*" eth-not-routed-via-tunnel "*)
+            ip rule add from "\$AP_IP_RANGE.0/24" to "\$AP_IP_RANGE.0/24" table main priority 100 2>/dev/null || true
+            ip rule add to "\$AP_IP_RANGE.0/24" table main priority 50 2>/dev/null || true
+            if [ "\$ETH_ENABLED" = "true" ]; then
+                ip rule add from "\$ETH_IP_RANGE.0/24" to "\$ETH_IP_RANGE.0/24" table main priority 100 2>/dev/null || true
+                ip rule add to "\$ETH_IP_RANGE.0/24" table main priority 50 2>/dev/null || true
+            fi
+            ;;
+    esac
+
+    case "\$problems" in
+        *" table52-no-default "*)
+            ip link show tailscale0 >/dev/null 2>&1 \
+                && ip route replace default dev tailscale0 table 52 2>/dev/null || true
+            ;;
+    esac
+
+    case "\$problems" in
+        *" nft-forward-rule-missing "*|*" nft-nat-rule-missing "*|*" nft-eth-forward-rule-missing "*|*" nft-eth-nat-rule-missing "*)
+            if [ -f /etc/nftables.conf ]; then
+                nft -f /etc/nftables.conf 2>/dev/null || true
+            fi
+            ;;
+    esac
+}
+
+# Use the same lock file as tunnel-exit-up.sh when publishing watchdog proof.
+# Holding this lock across curl + stamp prevents a concurrent reset from
+# clearing proof and then having an in-flight old check write it back.
+exec 8>/run/tunnel-exit-up.lock
+
 while true; do
     sleep 30  # Check every 30 seconds for faster recovery
 
+    WD_BRINGUP_BUSY=false
+    # Pick up proof produced by the boot service or another serialized caller.
+    if flock -n 8; then
+        wd_read_verified
+        flock -u 8
+    else
+        WD_BRINGUP_BUSY=true
+        WD_LAST_VERIFIED=0
+    fi
+
     # CRITICAL: Ensure hotel Wi-Fi (onboard) stays managed by NetworkManager
     if nmcli device status 2>/dev/null | grep -q "\$HOTEL_WIFI.*unmanaged"; then
-        echo "[Watchdog] \$HOTEL_WIFI (hotel Wi-Fi) became unmanaged, fixing..."
+        wd_log "[Watchdog] \$HOTEL_WIFI (hotel Wi-Fi) became unmanaged, fixing..."
         nmcli device set "\$HOTEL_WIFI" managed yes 2>/dev/null || true
         sleep 2
     fi
@@ -2606,7 +2958,7 @@ while true; do
     # CRITICAL: Keep power save OFF on hotel WiFi to prevent disconnections
     POWER_SAVE=\$(iw dev "\$HOTEL_WIFI" get power_save 2>/dev/null | grep -o "on\|off" || echo "unknown")
     if [ "\$POWER_SAVE" = "on" ]; then
-        echo "[Watchdog] Power save was re-enabled on \$HOTEL_WIFI, disabling..."
+        wd_log "[Watchdog] Power save was re-enabled on \$HOTEL_WIFI, disabling..."
         iw dev "\$HOTEL_WIFI" set power_save off 2>/dev/null || true
     fi
 
@@ -2619,10 +2971,10 @@ while true; do
         sleep 1
         AP_POWER_SAVE_AFTER=\$(iw dev "\$AP_WIFI" get power_save 2>/dev/null | grep -o "on\|off" || echo "unknown")
         if [ "\$AP_POWER_SAVE_AFTER" = "off" ]; then
-            echo "[Watchdog] Disabled power save on \$AP_WIFI"
+            wd_log "[Watchdog] Disabled power save on \$AP_WIFI"
             AP_POWER_SAVE_WARNING_REPORTED=false
         elif [ "\$AP_POWER_SAVE_WARNING_REPORTED" != "true" ]; then
-            echo "[Watchdog] \$AP_WIFI driver refuses power_save=off in AP mode; applied before AP startup and will keep retrying silently"
+            wd_log "[Watchdog] \$AP_WIFI driver refuses power_save=off in AP mode; applied before AP startup and will keep retrying silently"
             AP_POWER_SAVE_WARNING_REPORTED=true
         fi
     else
@@ -2637,18 +2989,18 @@ while true; do
 
     # Check if hotel Wi-Fi is connected (has IP address)
     if ! ip addr show "\$HOTEL_WIFI" 2>/dev/null | grep -q "inet "; then
-        echo "[Watchdog] Hotel Wi-Fi (\$HOTEL_WIFI) lost IP, attempting to reconnect..."
+        wd_log "[Watchdog] Hotel Wi-Fi (\$HOTEL_WIFI) lost IP, attempting to reconnect..."
 
         # Use nmcli instead of dhcpcd to avoid NetworkManager conflicts
         CURRENT_CONNECTION=\$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep ":\$HOTEL_WIFI\$" | cut -d: -f1)
         if [ -n "\$CURRENT_CONNECTION" ]; then
-            echo "[Watchdog] Reconnecting to '\$CURRENT_CONNECTION'..."
+            wd_log "[Watchdog] Reconnecting to '\$CURRENT_CONNECTION'..."
             nmcli connection down "\$CURRENT_CONNECTION" 2>/dev/null || true
             sleep 2
             nmcli connection up "\$CURRENT_CONNECTION" 2>/dev/null || true
         else
             # No active connection - try to connect to any saved wifi network
-            echo "[Watchdog] No active connection, scanning for saved networks..."
+            wd_log "[Watchdog] No active connection, scanning for saved networks..."
             nmcli device wifi rescan ifname "\$HOTEL_WIFI" 2>/dev/null || true
             sleep 3
 
@@ -2658,9 +3010,9 @@ while true; do
             # Try each saved wifi connection
             for SAVED in \$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep ":wifi\$" | cut -d: -f1); do
                 if echo "\$AVAILABLE_SSIDS" | grep -qx "\$SAVED"; then
-                    echo "[Watchdog] Found saved network '\$SAVED', connecting..."
+                    wd_log "[Watchdog] Found saved network '\$SAVED', connecting..."
                     if nmcli device wifi connect "\$SAVED" ifname "\$HOTEL_WIFI" 2>/dev/null; then
-                        echo "[Watchdog] Connected to '\$SAVED'"
+                        wd_log "[Watchdog] Connected to '\$SAVED'"
                         break
                     fi
                 fi
@@ -2677,8 +3029,9 @@ while true; do
     # shared bring-up script instead: it stops the AP, does a full down/up
     # reset, verifies egress, and only brings the AP back if that succeeded.
     WD_NEEDS_RESET=false
+    WD_NOW=\$(date +%s)
     if ! tailscale status 2>/dev/null | grep -q "active.*exit node"; then
-        echo "[Watchdog] Tailscale exit node not active"
+        wd_log "[Watchdog] Tailscale exit node not active"
         WD_NEEDS_RESET=true
     else
         # "active exit node" only means Tailscale believes the peer is selected.
@@ -2686,25 +3039,122 @@ while true; do
         # session was up and passing bulk traffic while DNS and the control
         # connection were dead. Periodically confirm egress actually leaves via
         # the exit node, so an active-but-broken tunnel still triggers a reset.
-        # Throttled to roughly every 10th loop (~5 min) to avoid hammering the
-        # check service on a healthy system.
-        WD_EGRESS_COUNTER=\$(( \${WD_EGRESS_COUNTER:-0} + 1 ))
-        if [ "\$WD_EGRESS_COUNTER" -ge 10 ]; then
-            WD_EGRESS_COUNTER=0
-            WD_EGRESS_IP=\$(curl -4fsS --max-time 15 https://api.ipify.org 2>/dev/null || echo "")
-            if [ -n "\$WD_EGRESS_IP" ] && [ "\$WD_EGRESS_IP" != "\$TAILSCALE_EXPECTED_IP" ]; then
-                echo "[Watchdog] Egress is \$WD_EGRESS_IP, expected \$TAILSCALE_EXPECTED_IP - tunnel is not carrying traffic"
-                WD_NEEDS_RESET=true
+        # Throttled by elapsed time rather than loop count, so the interval holds
+        # even when a loop blocks for a while on reconnect work.
+        if [ "\$WD_EGRESS_FAIL_STREAK" -gt 0 ]; then
+            WD_EGRESS_INTERVAL="\$WD_EGRESS_INTERVAL_BAD"
+        else
+            WD_EGRESS_INTERVAL="\$WD_EGRESS_INTERVAL_OK"
+        fi
+        if [ \$(( WD_NOW - WD_LAST_EGRESS_CHECK )) -ge "\$WD_EGRESS_INTERVAL" ]; then
+            if flock -n 8; then
+                WD_LAST_EGRESS_CHECK=\$WD_NOW
+                WD_EGRESS_IP=\$(curl -4fsS --max-time 15 https://api.ipify.org 2>/dev/null || echo "")
+                if [ "\$WD_EGRESS_IP" = "\$TAILSCALE_EXPECTED_IP" ]; then
+                    WD_EGRESS_FAIL_STREAK=0
+                    wd_mark_verified
+                else
+                    # An EMPTY result means the check could not complete at all --
+                    # i.e. the tunnel is carrying nothing. This used to be guarded by
+                    # [ -n "\$WD_EGRESS_IP" ], so a totally dead tunnel read as healthy
+                    # while merely a wrong egress IP triggered a reset. That is exactly
+                    # backwards, and it is why an AP could sit up for hours in front of
+                    # a dead tunnel. Treat no answer as failure.
+                    WD_EGRESS_FAIL_STREAK=\$(( WD_EGRESS_FAIL_STREAK + 1 ))
+                    if [ -z "\$WD_EGRESS_IP" ]; then
+                        wd_log "[Watchdog] Egress check returned nothing (streak \$WD_EGRESS_FAIL_STREAK) - tunnel is carrying no traffic"
+                    else
+                        wd_log "[Watchdog] Egress is \$WD_EGRESS_IP, expected \$TAILSCALE_EXPECTED_IP (streak \$WD_EGRESS_FAIL_STREAK)"
+                    fi
+                    # Require two consecutive failures before tearing the tunnel down,
+                    # so one timed-out request on a flaky hotel link does not cause a
+                    # reset storm. With WD_EGRESS_INTERVAL_BAD that confirms in ~1 min.
+                    if [ "\$WD_EGRESS_FAIL_STREAK" -ge 2 ]; then
+                        WD_NEEDS_RESET=true
+                    fi
+                fi
+                flock -u 8
+            else
+                WD_BRINGUP_BUSY=true
+                WD_LAST_VERIFIED=0
             fi
         fi
     fi
 
-    if [ "\$WD_NEEDS_RESET" = true ]; then
-        echo "[Watchdog] Resetting tunnel..."
-        if /usr/local/bin/tunnel-exit-up.sh; then
-            echo "[Watchdog] Tunnel restored and verified"
+    # Probe the client forwarding path, but only when the tunnel itself is
+    # believed healthy -- if a reset is already queued, tailscale0 is expected
+    # to be absent and every probe result would be noise.
+    if [ "\$WD_NEEDS_RESET" = false ] \
+        && [ \$(( \$(date +%s) - WD_LAST_VERIFIED )) -lt "\$WD_VERIFY_MAX_AGE" ]; then
+        # A previous fail-closed transition may have lowered the wired link.
+        # Restore it after verified egress and before asking the kernel to
+        # evaluate a packet arriving on that interface.
+        if [ "\$ETH_ENABLED" = "true" ]; then
+            ip link set "\$ETH_INTERFACE" up 2>/dev/null || true
+            ip addr replace "\$ETH_GATEWAY/24" dev "\$ETH_INTERFACE" 2>/dev/null || true
+        fi
+        WD_PATH_PROBLEMS=\$(wd_client_path_problems)
+        if [ -n "\$WD_PATH_PROBLEMS" ]; then
+            wd_log "[Watchdog] Client forwarding path broken:\$WD_PATH_PROBLEMS - repairing in place..."
+            wd_repair_client_path "\$WD_PATH_PROBLEMS"
+            sleep 2
+            WD_PATH_PROBLEMS=\$(wd_client_path_problems)
+            if [ -n "\$WD_PATH_PROBLEMS" ]; then
+                wd_log "[Watchdog] Still broken after in-place repair:\$WD_PATH_PROBLEMS - escalating to full tunnel reset"
+                WD_NEEDS_RESET=true
+            else
+                wd_log "[Watchdog] Client forwarding path repaired in place (no client disruption)"
+            fi
+        fi
+    fi
+
+    # Hold off on a reset that would interrupt tailscaled's own recovery.
+    if [ "\$WD_NEEDS_RESET" = true ] && wd_control_reconnecting; then
+        WD_RECONNECT_NOW=\$(date +%s)
+        if [ "\$WD_RECONNECT_SINCE" -eq 0 ]; then
+            WD_RECONNECT_SINCE=\$WD_RECONNECT_NOW
+        fi
+        WD_RECONNECT_FOR=\$(( WD_RECONNECT_NOW - WD_RECONNECT_SINCE ))
+        if [ "\$WD_RECONNECT_FOR" -lt "\$WD_RECONNECT_GRACE" ]; then
+            wd_log "[Watchdog] tailscaled is re-establishing its control connection (\${WD_RECONNECT_FOR}s of \${WD_RECONNECT_GRACE}s grace) - deferring reset"
+            WD_NEEDS_RESET=false
         else
-            echo "[Watchdog] Tunnel reset FAILED - AP left stopped (fail closed)"
+            wd_log "[Watchdog] No control connection after \${WD_RECONNECT_FOR}s - tailscaled is not recovering on its own, resetting"
+        fi
+    elif ! wd_control_reconnecting; then
+        WD_RECONNECT_SINCE=0
+    fi
+
+    if [ "\$WD_NEEDS_RESET" = true ]; then
+        wd_log "[Watchdog] Resetting tunnel..."
+        # A reset invalidates the old proof immediately. The bring-up script is
+        # solely responsible for publishing new proof after real verification.
+        # Clear the watchdog's local copy before invoking it. The script clears
+        # the shared stamp after acquiring its lock; removing the file here
+        # would race with another caller that has just published valid proof.
+        WD_LAST_VERIFIED=0
+        /usr/local/bin/tunnel-exit-up.sh
+        WD_RESET_STATUS=\$?
+        if [ "\$WD_RESET_STATUS" -eq 0 ]; then
+            wd_read_verified
+            if [ "\$WD_LAST_VERIFIED" -eq 0 ]; then
+                wd_log "[Watchdog] Tunnel bring-up returned success without verification proof - keeping AP closed"
+                WD_LAST_EGRESS_CHECK=0
+                WD_EGRESS_FAIL_STREAK=1
+            else
+                wd_log "[Watchdog] Tunnel restored and verified"
+                WD_LAST_EGRESS_CHECK=\$WD_LAST_VERIFIED
+                WD_EGRESS_FAIL_STREAK=0
+                WD_RECONNECT_SINCE=0
+            fi
+        elif [ "\$WD_RESET_STATUS" -eq 75 ]; then
+            # The active caller has already invalidated stale proof and will
+            # publish a new stamp itself if and only if it verifies egress.
+            WD_BRINGUP_BUSY=true
+            wd_log "[Watchdog] Tunnel bring-up already in progress - awaiting its verification"
+        else
+            wd_clear_verified
+            wd_log "[Watchdog] Tunnel reset FAILED - AP left stopped (fail closed)"
         fi
         sleep 5
     fi
@@ -2752,12 +3202,12 @@ while true; do
                     fi
 
                     if { [ "\$WD_NEIGH_BAD" = true ] || [ "\$WD_GW_OUTSIDE" = true ]; } && [ "\$WD_CANDIDATE" != "\$WD_GW" ]; then
-                        echo "[Watchdog] Gateway \$WD_GW looks broken (ARP bad: \$WD_NEIGH_BAD, outside subnet: \$WD_GW_OUTSIDE) - trying \$WD_CANDIDATE (route-only, not persisted)..."
+                        wd_log "[Watchdog] Gateway \$WD_GW looks broken (ARP bad: \$WD_NEIGH_BAD, outside subnet: \$WD_GW_OUTSIDE) - trying \$WD_CANDIDATE (route-only, not persisted)..."
                         if ip route replace default via "\$WD_CANDIDATE" dev "\$HOTEL_WIFI" 2>/dev/null && wd_check_internet; then
-                            echo "[Watchdog] Gateway autofix succeeded - now routing via \$WD_CANDIDATE"
+                            wd_log "[Watchdog] Gateway autofix succeeded - now routing via \$WD_CANDIDATE"
                             WD_AUTOFIX_OK=true
                         else
-                            echo "[Watchdog] Gateway autofix candidate \$WD_CANDIDATE did not restore connectivity - reverting"
+                            wd_log "[Watchdog] Gateway autofix candidate \$WD_CANDIDATE did not restore connectivity - reverting"
                             ip route replace default via "\$WD_GW" dev "\$HOTEL_WIFI" 2>/dev/null || true
                         fi
                     fi
@@ -2770,35 +3220,35 @@ while true; do
         # and the real gateway may drop ping-to-self (this exact hotel's did), so the
         # gateway ping below would be a false negative that undoes the repair.
         if [ "\$WD_AUTOFIX_OK" = true ]; then
-            echo "[Watchdog] Gateway autofix restored internet - skipping reconnect this cycle"
+            wd_log "[Watchdog] Gateway autofix restored internet - skipping reconnect this cycle"
         else
-        echo "[Watchdog] Internet unreachable, checking hotel Wi-Fi gateway..."
+        wd_log "[Watchdog] Internet unreachable, checking hotel Wi-Fi gateway..."
         GATEWAY=\$(ip route show dev "\$HOTEL_WIFI" | grep default | awk '{print \$3}' | head -1)
         if [ -n "\$GATEWAY" ]; then
             if ! ping -c 1 -W 2 "\$GATEWAY" >/dev/null 2>&1; then
-                echo "[Watchdog] Gateway unreachable, attempting to reconnect..."
+                wd_log "[Watchdog] Gateway unreachable, attempting to reconnect..."
 
                 # Get the current or last connection name for this device
                 CURRENT_CONN=\$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep ":\$HOTEL_WIFI\$" | cut -d: -f1)
 
                 if [ -n "\$CURRENT_CONN" ]; then
                     # Connection exists but gateway unreachable - restart it
-                    echo "[Watchdog] Restarting connection '\$CURRENT_CONN'..."
+                    wd_log "[Watchdog] Restarting connection '\$CURRENT_CONN'..."
                     nmcli connection down "\$CURRENT_CONN" 2>/dev/null || true
                     sleep 2
                     nmcli connection up "\$CURRENT_CONN" 2>/dev/null || true
                 else
                     # No active connection - scan and connect to saved network
-                    echo "[Watchdog] No active connection, scanning for saved networks..."
+                    wd_log "[Watchdog] No active connection, scanning for saved networks..."
                     nmcli device wifi rescan ifname "\$HOTEL_WIFI" 2>/dev/null || true
                     sleep 3
 
                     AVAILABLE=\$(nmcli -t -f SSID device wifi list ifname "\$HOTEL_WIFI" 2>/dev/null | sort -u | grep -v "^\$")
                     for SAVED in \$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep ":wifi\$" | cut -d: -f1); do
                         if echo "\$AVAILABLE" | grep -qx "\$SAVED"; then
-                            echo "[Watchdog] Connecting to saved network '\$SAVED'..."
+                            wd_log "[Watchdog] Connecting to saved network '\$SAVED'..."
                             if nmcli device wifi connect "\$SAVED" ifname "\$HOTEL_WIFI" 2>/dev/null; then
-                                echo "[Watchdog] Connected to '\$SAVED'"
+                                wd_log "[Watchdog] Connected to '\$SAVED'"
                                 break
                             fi
                         fi
@@ -2808,16 +3258,16 @@ while true; do
             fi
         else
             # No gateway means no connection at all - try to connect
-            echo "[Watchdog] No gateway found, WiFi likely disconnected. Reconnecting..."
+            wd_log "[Watchdog] No gateway found, WiFi likely disconnected. Reconnecting..."
             nmcli device wifi rescan ifname "\$HOTEL_WIFI" 2>/dev/null || true
             sleep 3
 
             AVAILABLE=\$(nmcli -t -f SSID device wifi list ifname "\$HOTEL_WIFI" 2>/dev/null | sort -u | grep -v "^\$")
             for SAVED in \$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep ":wifi\$" | cut -d: -f1); do
                 if echo "\$AVAILABLE" | grep -qx "\$SAVED"; then
-                    echo "[Watchdog] Connecting to saved network '\$SAVED'..."
+                    wd_log "[Watchdog] Connecting to saved network '\$SAVED'..."
                     if nmcli device wifi connect "\$SAVED" ifname "\$HOTEL_WIFI" 2>/dev/null; then
-                        echo "[Watchdog] Connected to '\$SAVED'"
+                        wd_log "[Watchdog] Connected to '\$SAVED'"
                         break
                     fi
                 fi
@@ -2826,21 +3276,50 @@ while true; do
         fi
     fi
 
+    # Re-read immediately before exposing client services. Another caller may
+    # have acquired the bring-up lock and invalidated proof while this loop was
+    # handling hotel connectivity.
+    if [ "\$WD_BRINGUP_BUSY" = true ]; then
+        WD_LAST_VERIFIED=0
+    elif flock -n 8; then
+        wd_read_verified
+        flock -u 8
+    else
+        WD_BRINGUP_BUSY=true
+        WD_LAST_VERIFIED=0
+    fi
+
     # ==========================================================================
     # ACCESS POINT MONITORING - Check if AP (wlan1) is healthy
     #
-    # Every restart below is gated on the exit node being active. Without that
-    # gate this section defeats the whole fail-closed design: tunnel-exit-up.sh
-    # stops the AP when verification fails, and 30 seconds later the watchdog
-    # would notice hostapd "is not running" and start it straight back up --
-    # exposing an access point with no tunnel behind it, which is exactly the
-    # state the drop policy and verification exist to prevent.
+    # Every restart below is gated on a RECENT PROVEN EGRESS, not on what
+    # Tailscale believes. Without that gate this section defeats the whole
+    # fail-closed design: tunnel-exit-up.sh stops the AP when verification
+    # fails, and 30 seconds later the watchdog notices hostapd "is not running"
+    # and starts it straight back up -- exposing an access point with no tunnel
+    # behind it, which is exactly the state the drop policy and verification
+    # exist to prevent.
+    #
+    # The gate used to be a "tailscale status" string match on active exit node,
+    # which is not the same claim at all: "tailscale up" succeeds and selects the
+    # peer long before (or entirely without) traffic flowing. After a power cut that
+    # string was true while the tunnel was dead, so the watchdog re-opened the AP
+    # that the boot-time bring-up had deliberately closed, and clients got DHCP
+    # leases onto a blackhole. WD_LAST_VERIFIED is only ever set by an egress
+    # check that actually came back with the exit node's address.
     # ==========================================================================
-    if tailscale status 2>/dev/null | grep -q "active.*exit node"; then
+    if [ \$(( \$(date +%s) - WD_LAST_VERIFIED )) -lt "\$WD_VERIFY_MAX_AGE" ]; then
+
+    # Wired clients share the same verification gate. Restore carrier and the
+    # static gateway only after egress has been proven.
+    if [ "\$ETH_ENABLED" = "true" ]; then
+        ip link set "\$ETH_INTERFACE" up 2>/dev/null || true
+        ip addr replace "\$ETH_GATEWAY/24" dev "\$ETH_INTERFACE" 2>/dev/null || true
+    fi
 
     # Check if AP interface has an IP address
     if ! ip addr show "\$AP_WIFI" 2>/dev/null | grep -q "inet "; then
-        echo "[Watchdog] AP interface \$AP_WIFI has no IP - restarting AP services..."
+        wd_log "[Watchdog] AP interface \$AP_WIFI has no IP - restarting AP services..."
         systemctl restart usb-wifi-ap 2>/dev/null || true
         sleep 2
         systemctl restart hostapd 2>/dev/null || true
@@ -2850,12 +3329,12 @@ while true; do
 
         # Verify fix worked
         if ip addr show "\$AP_WIFI" 2>/dev/null | grep -q "inet "; then
-            echo "[Watchdog] AP interface \$AP_WIFI recovered successfully"
+            wd_log "[Watchdog] AP interface \$AP_WIFI recovered successfully"
         else
             # Use the configured gateway, not a hardcoded address. This was
             # 10.0.50.1/24 regardless of AP_GATEWAY, so on any other AP subnet
             # the "recovery" assigned an address no client could route to.
-            echo "[Watchdog] AP recovery failed - manually assigning IP..."
+            wd_log "[Watchdog] AP recovery failed - manually assigning IP..."
             ip addr add ${AP_GATEWAY}/24 dev "\$AP_WIFI" 2>/dev/null || true
             systemctl restart hostapd 2>/dev/null || true
             systemctl restart dnsmasq 2>/dev/null || true
@@ -2864,7 +3343,7 @@ while true; do
 
     # Check if hostapd is running
     if ! systemctl is-active --quiet hostapd 2>/dev/null; then
-        echo "[Watchdog] hostapd is not running - restarting..."
+        wd_log "[Watchdog] hostapd is not running - restarting..."
         systemctl restart usb-wifi-ap 2>/dev/null || true
         sleep 2
         systemctl restart hostapd 2>/dev/null || true
@@ -2874,26 +3353,54 @@ while true; do
 
     # Check if dnsmasq is running
     if ! systemctl is-active --quiet dnsmasq 2>/dev/null; then
-        echo "[Watchdog] dnsmasq is not running - restarting..."
+        wd_log "[Watchdog] dnsmasq is not running - restarting..."
         systemctl restart dnsmasq 2>/dev/null || true
     fi
 
     else
-        echo "[Watchdog] Exit node not active - leaving AP services stopped (fail closed)"
+        # Actively take the AP down, not merely decline to start it. nftables
+        # already drops client traffic with no tunnel behind it, so nothing leaks
+        # either way -- but an SSID that is present and hands out DHCP leases onto
+        # a blackhole is indistinguishable from a working tunnel until you try to
+        # load a page. Removing the SSID makes the failure obvious instead.
+        #
+        # Safe across watchdog restarts: a successful boot-time or prior
+        # watchdog verification is inherited from /run. With no inherited
+        # proof, the immediate egress check above must succeed before either
+        # Wi-Fi or wired clients are exposed.
+        if systemctl is-active --quiet hostapd 2>/dev/null \
+            || systemctl is-active --quiet dnsmasq 2>/dev/null; then
+            wd_log "[Watchdog] No verified egress in the last \${WD_VERIFY_MAX_AGE}s - stopping AP (fail closed)"
+            systemctl stop hostapd 2>/dev/null || true
+            systemctl stop dnsmasq 2>/dev/null || true
+        fi
+        if [ "\$ETH_ENABLED" = "true" ]; then
+            # Taking the interface administratively down gives wired clients an
+            # immediate link-loss signal instead of leaving them on a blackhole.
+            ip link set "\$ETH_INTERFACE" down 2>/dev/null || true
+        fi
     fi
 
     # ==========================================================================
     # ETHERNET SHARING MONITORING - Check if the wired interface still holds its
     # static gateway address (ETH_ENABLE=true only)
     # ==========================================================================
-    if [ "\$ETH_ENABLED" = "true" ]; then
+    if [ "\$ETH_ENABLED" = "true" ] \
+        && [ \$(( \$(date +%s) - WD_LAST_VERIFIED )) -lt "\$WD_VERIFY_MAX_AGE" ]; then
         if ! ip addr show "\$ETH_INTERFACE" 2>/dev/null | grep -q "\$ETH_GATEWAY"; then
-            echo "[Watchdog] Ethernet interface \$ETH_INTERFACE lost \$ETH_GATEWAY - re-applying..."
+            wd_log "[Watchdog] Ethernet interface \$ETH_INTERFACE lost \$ETH_GATEWAY - re-applying..."
             ip addr add "\$ETH_GATEWAY/24" dev "\$ETH_INTERFACE" 2>/dev/null || true
         fi
     fi
 done
 SCRIPTEOF
+
+# Stop any watchdog already running BEFORE overwriting its script. bash reads a
+# script incrementally by byte offset, so rewriting the file underneath a live
+# interpreter can make it resume mid-token in the new text. Stopping first also
+# guarantees the "systemctl restart" below actually picks up this new copy
+# rather than leaving a days-old process running fixed code it never read.
+sudo systemctl stop tunnel-watchdog 2>/dev/null || true
 
 # Copy script to final location and make executable
 sudo cp /tmp/tunnel-watchdog.sh /usr/local/bin/tunnel-watchdog.sh
@@ -2936,6 +3443,41 @@ if [ ! -f /etc/systemd/system/tunnel-watchdog.service ]; then
     echo "❌ Failed to create watchdog service file!"
     exit 1
 fi
+
+# --- Persistent logs for the two units that matter, WITHOUT persistent journald ---
+# journald here runs volatile (logs in /run, wiped every reboot), which is why a
+# power cut leaves nothing to diagnose. Making the whole journal persistent would
+# work but writes far more to the SD card than these two units justify -- dnsmasq
+# alone would dominate it. Send just these units to a file instead: the watchdog
+# only prints when it takes action, so a healthy day writes essentially nothing,
+# and logrotate below bounds it regardless.
+echo "=== Configuring persistent logging for tunnel units ==="
+for unit in tunnel-watchdog tailscale-exit; do
+    sudo mkdir -p "/etc/systemd/system/${unit}.service.d"
+    sudo tee "/etc/systemd/system/${unit}.service.d/log.conf" > /dev/null <<'LOGEOF'
+[Service]
+StandardOutput=append:/var/log/tunnel.log
+StandardError=append:/var/log/tunnel.log
+LOGEOF
+done
+
+sudo touch /var/log/tunnel.log
+sudo chmod 640 /var/log/tunnel.log
+
+# copytruncate because both units hold the file open for the life of the service;
+# a rename-based rotation would leave them writing to the rotated inode forever.
+sudo tee /etc/logrotate.d/tunnel > /dev/null <<'ROTEOF'
+/var/log/tunnel.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+ROTEOF
+echo "   ✅ tunnel-watchdog and tailscale-exit now log to /var/log/tunnel.log"
 
 sudo systemctl daemon-reload
 sudo systemctl enable tunnel-watchdog
@@ -3046,7 +3588,11 @@ fi
 
 # The watchdog starts only after a verified tunnel, so it can never be the thing
 # that brings the AP up on an unverified one.
-sudo systemctl start tunnel-watchdog
+#
+# restart, not start: "systemctl start" on an already-active unit is a silent
+# no-op, so re-running this script used to leave the previous watchdog process
+# alive while the new script sat unread on disk.
+sudo systemctl restart tunnel-watchdog
 
 # hostapd may reset driver power state while bringing up the AP. Apply once more
 # after startup and report the actual state instead of assuming success.
@@ -3356,7 +3902,8 @@ echo "  - Authenticate Tailscale: sudo tailscale up"
 echo "  - Configure exit node: sudo tailscale up --exit-node=$TAILSCALE_EXIT_NODE_IP --exit-node-allow-lan-access=false --accept-routes --accept-dns"
 echo "  - Fix routing: sudo ip route del 0.0.0.0/1 dev tailscale0; sudo ip route del 128.0.0.0/1 dev tailscale0"
 echo "  - Restart services: sudo systemctl restart hostapd dnsmasq"
-echo "  - Check watchdog logs: sudo journalctl -u tunnel-watchdog -f"
+echo "  - Check watchdog logs: sudo tail -f /var/log/tunnel.log"
+echo "    (survives reboots and power cuts; journald here is volatile)"
 echo ""
 echo "🛡️  Connection Stability Features:"
 echo "  - NetworkManager manages hotel Wi-Fi ($ONBOARD_WIFI) - nmtui works!"
