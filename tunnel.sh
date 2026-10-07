@@ -3375,9 +3375,21 @@ while true; do
             systemctl stop dnsmasq 2>/dev/null || true
         fi
         if [ "\$ETH_ENABLED" = "true" ]; then
-            # Taking the interface administratively down gives wired clients an
-            # immediate link-loss signal instead of leaving them on a blackhole.
-            ip link set "\$ETH_INTERFACE" down 2>/dev/null || true
+            # Deliberately do NOT take the wired link down here. Stopping dnsmasq
+            # above already denies new leases, and nftables drops forwarded client
+            # traffic with no tunnel behind it, so fail-closed is fully enforced
+            # without touching the link.
+            #
+            # Downing the interface instead created an unrecoverable lockout: the
+            # only path that raises it again is gated on fresh verified egress
+            # (WD_LAST_VERIFIED, see the eth restore above), so a Pi that lost
+            # upstream Wi-Fi dropped carrier on the management port and could never
+            # bring it back -- the cable exists precisely to fix a broken upstream.
+            # Keeping the gateway address assigned is what makes the documented
+            # "ssh \$ETH_GATEWAY works before the Pi has any upstream internet at
+            # all" guarantee true.
+            ip link set "\$ETH_INTERFACE" up 2>/dev/null || true
+            ip addr replace "\$ETH_GATEWAY/24" dev "\$ETH_INTERFACE" 2>/dev/null || true
         fi
     fi
 
@@ -3385,11 +3397,14 @@ while true; do
     # ETHERNET SHARING MONITORING - Check if the wired interface still holds its
     # static gateway address (ETH_ENABLE=true only)
     # ==========================================================================
-    if [ "\$ETH_ENABLED" = "true" ] \
-        && [ \$(( \$(date +%s) - WD_LAST_VERIFIED )) -lt "\$WD_VERIFY_MAX_AGE" ]; then
+    # Not gated on verified egress: the wired gateway address is the management
+    # path, and it has to survive exactly the outage it is used to repair. Holding
+    # the address leaks nothing -- dnsmasq is stopped and nftables drops forwarded
+    # client traffic whenever egress is unverified.
+    if [ "\$ETH_ENABLED" = "true" ]; then
         if ! ip addr show "\$ETH_INTERFACE" 2>/dev/null | grep -q "\$ETH_GATEWAY"; then
             wd_log "[Watchdog] Ethernet interface \$ETH_INTERFACE lost \$ETH_GATEWAY - re-applying..."
-            ip addr add "\$ETH_GATEWAY/24" dev "\$ETH_INTERFACE" 2>/dev/null || true
+            ip addr replace "\$ETH_GATEWAY/24" dev "\$ETH_INTERFACE" 2>/dev/null || true
         fi
     fi
 done
