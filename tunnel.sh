@@ -834,6 +834,73 @@ else
     echo "   IP address: NONE"
 fi
 
+# --- Fail-closed cleanup for everything below this point --------------------
+# From here on the script deliberately puts the Pi into states that leak if it
+# stops early: the exit node is cleared to test the raw uplink (just below), and
+# a few hundred lines later resolv.conf is pointed at public DNS so apt can run.
+# Both are undone on the happy path and NEITHER used to be undone on an abort --
+# and there are five "exit 1" sites between here and the end of that window (no
+# internet x3, Tailscale not installed, Tailscale not authenticated), plus every
+# unexpected non-zero exit that "set -e" turns into one.
+#
+# Losing the uplink mid-run was therefore enough to leave the box permanently
+# resolving via the hotel router with no exit node. Register one EXIT trap that
+# restores both, so the window cannot be escaped in a leaking state. Two flags,
+# because the two states open at different points.
+TS_EXIT_NODE_CLEARED=false
+DNS_LEAK_WINDOW_OPEN=false
+
+restore_fail_closed_state() {
+    # "set -e" is still in force inside an EXIT trap, so a single failing command
+    # here would abandon the rest of the cleanup -- e.g. a chattr that the
+    # filesystem rejects would skip the exit-node restore below entirely. Cleanup
+    # must be unconditional, so drop errexit for the duration and guard each step
+    # on its own.
+    set +e
+
+    # Pin DNS back to Tailscale-only first -- it is the leak that matters. With no
+    # tunnel this resolves nothing, which is the correct outcome: a Pi that cannot
+    # resolve is a visible failure, a Pi quietly resolving via the hotel is a
+    # silent leak.
+    if [ "$DNS_LEAK_WINDOW_OPEN" = true ]; then
+        DNS_LEAK_WINDOW_OPEN=false
+        echo ""
+        echo "🔒 Closing DNS leak window - pinning resolv.conf to Tailscale DNS only"
+        sudo chattr -i /etc/resolv.conf 2>/dev/null || true
+        sudo rm -f /etc/resolv.conf 2>/dev/null || true
+        if echo "nameserver ${TAILSCALE_DNS:-100.100.100.100}" | sudo tee /etc/resolv.conf > /dev/null; then
+            sudo chattr +i /etc/resolv.conf 2>/dev/null || true
+        else
+            # Worth shouting about: the box is still leaking and no later step
+            # will fix it, so the operator has to.
+            echo "   ❌ FAILED to write /etc/resolv.conf - this Pi is STILL LEAKING DNS."
+            echo "      Fix by hand:  sudo chattr -i /etc/resolv.conf"
+            echo "                    echo nameserver ${TAILSCALE_DNS:-100.100.100.100} | sudo tee /etc/resolv.conf"
+            echo "                    sudo chattr +i /etc/resolv.conf"
+        fi
+    fi
+
+    # Re-assert the exit node the raw-internet test cleared. Only when tailscaled
+    # is actually authenticated: when it is not (the exit at
+    # ensure_tailscale_authenticated) "tailscale up" would block on an auth URL,
+    # and the DNS pin above has already stopped the leak either way.
+    if [ "$TS_EXIT_NODE_CLEARED" = true ]; then
+        TS_EXIT_NODE_CLEARED=false
+        if [ -n "${TAILSCALE_EXIT_NODE_IP:-}" ] \
+            && command -v tailscale >/dev/null 2>&1 \
+            && tailscale status >/dev/null 2>&1; then
+            echo "🔒 Re-asserting exit node $TAILSCALE_EXIT_NODE_IP (fail closed)"
+            sudo timeout 30 tailscale up \
+                --exit-node="$TAILSCALE_EXIT_NODE_IP" \
+                --exit-node-allow-lan-access=false \
+                --accept-routes \
+                --accept-dns >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+trap restore_fail_closed_state EXIT
+
 # Clear stale Tailscale exit node BEFORE testing connectivity.
 # A previous tunnel.sh run may have configured Tailscale to route all traffic
 # through the exit node. If the tunnel isn't fully set up, this blackholes all traffic.
@@ -841,6 +908,7 @@ if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; the
     CURRENT_EXIT_NODE=$(tailscale status --json 2>/dev/null | grep -o '"ExitNodeStatus":{[^}]*}' || echo "")
     if [ -n "$CURRENT_EXIT_NODE" ] && [ "$CURRENT_EXIT_NODE" != '{}' ]; then
         echo "   ⚠️  Tailscale exit node is active — clearing it to test raw internet..."
+        TS_EXIT_NODE_CLEARED=true
         sudo tailscale up --exit-node= --accept-routes=false 2>/dev/null || true
         sleep 2
     fi
@@ -1034,11 +1102,24 @@ sudo cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null || true
 sudo systemctl stop systemd-resolved 2>/dev/null || true
 
 # Force DNS to use public DNS servers
+#
+# This opens a DELIBERATE DNS leak: until the "Restoring DNS management" step
+# several hundred lines below swaps in Tailscale-only DNS, every lookup this Pi
+# makes goes straight out the local uplink. That is the point -- apt needs to
+# resolve before Tailscale is configured -- but it means the window must not be
+# escapable in the leaking state. restore_fail_closed_state (registered as an
+# EXIT trap further up) is what guarantees that; DNS_LEAK_WINDOW_OPEN below is
+# what tells it the window is open.
 sudo chattr -i /etc/resolv.conf 2>/dev/null || true
 sudo rm -f /etc/resolv.conf
+DNS_LEAK_WINDOW_OPEN=true
 echo "nameserver ${FALLBACK_DNS_PRIMARY:-8.8.8.8}" | sudo tee /etc/resolv.conf > /dev/null
 echo "nameserver ${FALLBACK_DNS_SECONDARY:-1.1.1.1}" | sudo tee -a /etc/resolv.conf > /dev/null
-echo "nameserver 192.168.1.1" | sudo tee -a /etc/resolv.conf > /dev/null
+# Deliberately NO third hardcoded "nameserver 192.168.1.1". It was not derived
+# from anything in tunnel.conf, and on most hotel and home LANs 192.168.1.1 is
+# the local router -- i.e. the one entry guaranteed to expose the real ISP
+# resolver on a leak test. The two configured public servers are enough to get
+# apt through setup.
 
 # Make it immutable temporarily to prevent Tailscale from overwriting
 sudo chattr +i /etc/resolv.conf 2>/dev/null || true
@@ -1699,9 +1780,17 @@ sudo systemctl disable systemd-resolved 2>/dev/null || true
 # With systemd-resolved disabled, Tailscale often cannot update resolv.conf on its own.
 # ONLY Tailscale DNS is used -- no public fallback to prevent DNS leaks.
 sudo rm -f /etc/resolv.conf
-echo "nameserver 100.100.100.100" | sudo tee /etc/resolv.conf > /dev/null
+echo "nameserver ${TAILSCALE_DNS:-100.100.100.100}" | sudo tee /etc/resolv.conf > /dev/null
 # Lock the file so NetworkManager/dhcpcd cannot overwrite it with local DHCP DNS.
 sudo chattr +i /etc/resolv.conf 2>/dev/null || true
+
+# Both fail-closed states the trap was covering are now restored by the normal
+# path, so disarm it. Leaving it armed would have it re-assert the exit node on
+# every later exit -- including a successful run, where the verified bring-up
+# below owns that decision and must not be second-guessed after the fact.
+DNS_LEAK_WINDOW_OPEN=false
+TS_EXIT_NODE_CLEARED=false
+trap - EXIT
 
 echo "=== Stop services while we configure ==="
 sudo systemctl stop hostapd || true
@@ -2030,11 +2119,20 @@ fi
 # hostapd uses: g (2.4GHz), a (5GHz), n (2.4GHz), but NOT "ac" directly
 # For "ac" mode, we use hw_mode=a and enable 802.11ac features
 HOSTAPD_HW_MODE="${AP_HW_MODE:-g}"
-if [ "$HOSTAPD_HW_MODE" = "ac" ] || [ "$HOSTAPD_HW_MODE" = "n" ]; then
-    # hostapd only accepts a/b/g here; n and ac are expressed via the
-    # ieee80211n/ieee80211ac flags below.
-    if [ "$HOSTAPD_HW_MODE" = "ac" ]; then HOSTAPD_HW_MODE="a"; else HOSTAPD_HW_MODE="g"; fi
+if [ "$HOSTAPD_HW_MODE" = "ac" ] || [ "$HOSTAPD_HW_MODE" = "ax" ] || [ "$HOSTAPD_HW_MODE" = "n" ]; then
+    # hostapd only accepts a/b/g here; n, ac and ax are expressed via the
+    # ieee80211n/ieee80211ac/ieee80211ax flags below.
+    case "$HOSTAPD_HW_MODE" in
+        ac|ax) HOSTAPD_HW_MODE="a" ;;
+        n)     HOSTAPD_HW_MODE="g" ;;
+    esac
 fi
+
+# Which band did the operator ask for? The ac/ax flags only apply on 5 GHz.
+case "${AP_HW_MODE:-g}" in
+    a|ac|ax) AP_BAND_IS_5GHZ=true ;;
+    *)       AP_BAND_IS_5GHZ=false ;;
+esac
 
 # Without ieee80211n=1 hostapd ignores ieee80211ac/ax and falls back to legacy
 # 11a/11g rates (54 Mbps PHY, ~5-20 Mbps real). Derive the HT40 secondary
@@ -2073,19 +2171,42 @@ wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
 ieee80211n=1
 ht_capab=$HT_CAPAB
-$(if [ "${AP_HW_MODE:-g}" = "a" ] || [ "${AP_HW_MODE:-g}" = "ac" ]; then
+$(
+# AP_HW_MODE selects the BAND. The 802.11ac/ax feature flags are separate
+# toggles below, and both default to enabled on 5 GHz -- which is the behavior
+# this script has always had and which tunnel.conf documents ("For WiFi 6
+# (802.11ax) adapters, use \"a\" mode with 5GHz channels"). Do not change what
+# an existing AP_HW_MODE value produces; someone's working AP depends on it.
+#
+# AP_ENABLE_AC / AP_ENABLE_AX exist so the PHY can be stepped DOWN deliberately
+# without redefining AP_HW_MODE. That matters because mt7921-based USB adapters
+# can wedge their transmit queue in AP mode, and narrowing the PHY is the
+# cheapest way to bisect it:
+#
+#   (defaults)                      -> ac + ax, 80 MHz   fastest
+#   AP_ENABLE_AX="false"            -> ac only, 80 MHz   drops the HE path
+#   AP_ENABLE_AC="false"            -> n only,  <=40 MHz  most conservative
+#
+# On a tunnelled AP this costs nothing measurable: the exit node, not the radio,
+# sets the ceiling (measured here: ~79 Mbps tunnel vs ~780-1200 Mbit/s PHY).
+if [ "$AP_BAND_IS_5GHZ" = true ] && [ "${AP_ENABLE_AC:-true}" = "true" ]; then
   echo "ieee80211ac=1"
   echo "vht_capab=[SHORT-GI-80]"
   if [ -n "$VHT_CENTER" ]; then
     echo "vht_oper_chwidth=1"
     echo "vht_oper_centr_freq_seg0_idx=$VHT_CENTER"
   fi
-  echo "ieee80211ax=1"
-  if [ -n "$VHT_CENTER" ]; then
-    echo "he_oper_chwidth=1"
-    echo "he_oper_centr_freq_seg0_idx=$VHT_CENTER"
+  # HE is layered on VHT here; enabling ax without ac is not a configuration
+  # this script has ever produced, so it is not offered.
+  if [ "${AP_ENABLE_AX:-true}" = "true" ]; then
+    echo "ieee80211ax=1"
+    if [ -n "$VHT_CENTER" ]; then
+      echo "he_oper_chwidth=1"
+      echo "he_oper_centr_freq_seg0_idx=$VHT_CENTER"
+    fi
   fi
-fi)
+fi
+)
 EOF
 
 sudo sed -i 's|#DAEMON_CONF="".*|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/default/hostapd
@@ -2121,11 +2242,41 @@ dhcp-option=tag:ap,6,$AP_GATEWAY
 # queries leak to the local ISP even though the exit node is working.
 no-resolv
 server=${TAILSCALE_DNS:-100.100.100.100}
+# This Pi is the only DHCP server on both of its subnets, so it should answer
+# authoritatively. Without this, a laptop that still remembers a lease from an
+# earlier boot sends a DHCPREQUEST for an address dnsmasq has no record of and
+# dnsmasq stays silent rather than NAKing it -- the client then sits through a
+# long timeout before falling back to DISCOVER. On the wired rescue path that is
+# the difference between plugging in the cable and being able to ssh within a
+# second or two, and appearing to be locked out.
+dhcp-authoritative
 # NOTE: log-queries is deliberately NOT enabled. It records every domain every
-# connected device resolves -- a plaintext browsing history sitting on the Pi's
-# SD card, and by far the largest write source on the system if the journal is
-# ever made persistent. log-dhcp is a few lines per client per lease and is
-# what actually helps when a device fails to get an address.
+# connected device resolves -- a plaintext browsing history on the Pi, and by
+# far the largest write source on the system if the journal is ever made
+# persistent.
+#
+# log-dhcp stays on: it is what diagnoses a client that cannot get an address,
+# and it earned its keep -- it is what proved an AP radio was receiving clients
+# while nothing it sent came back (DHCPREQUEST arriving, DHCPACK answered,
+# client retrying as if nothing was ever sent). No service check saw that.
+#
+# But it is NOT cheap, and an earlier version of this comment understated it as
+# "a few lines per client per lease". Measured: ~20 journal lines per DHCP
+# transaction (every option echoed individually), and a single retrying phone
+# emitted ~160 lines in 15 seconds. journald on this Pi is PERSISTENT
+# (/var/log/journal exists), so those lines do land on the SD card -- an earlier
+# comment claimed otherwise without checking.
+#
+# Kept anyway, as a deliberate trade. Normal cost is genuinely low: leases are
+# DHCP_LEASE_TIME (12h) with renewals at T1, so a handful of clients produce a
+# few transactions a day. The 160-line burst only happens when DHCP is FAILING,
+# which is exactly when the detail is worth having. The journal is now size-
+# capped (see journald.conf.d/tunnel-sd-wear.conf), so a retry storm costs
+# bounded space rather than unbounded growth.
+#
+# If DHCP logging ever needs to go, drop this line rather than tightening
+# journald's global rate limit -- that would silently cost every other unit's
+# detail during an incident.
 log-dhcp
 ${ETH_DNSMASQ_BLOCK}
 EOF
@@ -2267,9 +2418,26 @@ ${ETH_NFT_CT_BLOCK}
         iifname "tailscale0" oifname "$USB_WIFI" accept
 ${ETH_NFT_FORWARD_BLOCK}    }
 
+    # Named counter for DNS leaving this Pi in plaintext on the uplink. Read by
+    # the watchdog's DNS leak check (wd_dns_leak_problems). A counter rather than
+    # a drop rule on purpose: tailscaled resolves controlplane.tailscale.com over
+    # the local network at cold start, via bootstrap DNS, BEFORE any tunnel
+    # exists. Dropping port 53 on the uplink would stop the tunnel from ever
+    # coming up and lock the box out for good -- the exact class of
+    # unrecoverable failure this script keeps having to design around. So this
+    # observes instead of enforcing, and the watchdog only treats growth as a
+    # leak while egress is verified, when nothing has any business resolving
+    # out there.
+    counter dns_leak_uplink {
+    }
+
     chain output {
         type filter hook output priority 0;
         policy accept;  # Allow all outgoing for now
+
+        # Count, do not block. See the comment on dns_leak_uplink above.
+        oifname "$ONBOARD_WIFI" udp dport 53 counter name dns_leak_uplink
+        oifname "$ONBOARD_WIFI" tcp dport 53 counter name dns_leak_uplink
     }
 }
 
@@ -2390,7 +2558,15 @@ fi
 # the AP goes down first and only comes back after the checks below pass.
 stop_ap() {
     systemctl stop hostapd 2>/dev/null || true
-    systemctl stop dnsmasq 2>/dev/null || true
+    # Same reasoning as the watchdog's fail-closed stop: dnsmasq serves DHCP for
+    # the wired subnet too, and this function runs on EVERY bring-up attempt --
+    # including the ones that happen while the upstream is broken and the cable
+    # is the only way in. Stopping hostapd removes the SSID, so Wi-Fi clients
+    # cannot associate regardless, and forwarded traffic is still dropped by
+    # nftables until egress verifies.
+    if [ "$ETH_ENABLED" != "true" ]; then
+        systemctl stop dnsmasq 2>/dev/null || true
+    fi
 }
 
 clear_verified() {
@@ -2721,6 +2897,7 @@ HOTEL_WIFI="$HOTEL_WIFI"
 AP_WIFI="$AP_WIFI"
 TAILSCALE_EXIT_NODE_IP="$TAILSCALE_EXIT_NODE_IP"
 TAILSCALE_EXPECTED_IP="$TAILSCALE_EXPECTED_IP"
+TAILSCALE_DNS="${TAILSCALE_DNS:-100.100.100.100}"
 ETH_ENABLED="$ETH_ENABLED"
 ETH_INTERFACE="$ETH_INTERFACE"
 ETH_GATEWAY="$ETH_GATEWAY"
@@ -2728,7 +2905,61 @@ GATEWAY_AUTOFIX="$GATEWAY_AUTOFIX"
 AP_IP_RANGE="$AP_IP_RANGE"
 AP_GATEWAY="$AP_GATEWAY"
 ETH_IP_RANGE="$ETH_IP_RANGE"
+REGULATORY_COUNTRY="${REGULATORY_COUNTRY:-US}"
 AP_POWER_SAVE_WARNING_REPORTED=false
+
+# --- AP radio health state -----------------------------------------------
+# Detects an mt7921u firmware TX stall: the transmit path stops draining while
+# the receive path keeps working. Diagnosed on this Pi by comparing a healthy
+# capture against a broken one on the same machine -- the only approach that
+# worked after four wrong mechanism-based theories.
+#
+#   working:  multicast TXQ  qsz-byt 0     qsz-pkt 0
+#   stalled:  multicast TXQ  qsz-byt 3960  qsz-pkt 66
+#
+# Symptoms, all of which fooled every pre-existing check: hostapd alive with
+# state=ENABLED, interface UP holding its address, channel legal at full
+# regulatory power, clients' frames ARRIVING and being answered -- and not one
+# reply ever reaching them. Clients retry, give up, and are evicted one by one
+# as "inactive". From the outside the SSID simply vanishes.
+#
+# Signals deliberately NOT used, both proven false positives here:
+#   - "iw dev <ap> info" txpower. Read 3.00 dBm while BROKEN and while WORKING.
+#     On mt7921 it does not track radiated power, which is also why
+#     "iw set txpower fixed 2000" reported success and changed nothing.
+#   - Regulatory domain vs REGULATORY_COUNTRY. This Pi reports "country 98",
+#     the alpha2 the kernel synthesizes for a custom/intersected domain, so the
+#     comparison can never match and would fire forever. The permitted channel
+#     list showed 36/40/44/48 at 23.0 dBm with no no-IR flag throughout the
+#     outage, so regulatory was never involved.
+# Both would have reloaded the Wi-Fi driver on healthy hardware, forever.
+
+# A real TXQ drains in milliseconds. Requiring a backlog to persist across this
+# many consecutive 30s samples -- AND tx_packets to be frozen meanwhile -- keeps
+# ordinary congestion from ever looking like a stall.
+AP_TXQ_STALL_SAMPLES="${AP_TXQ_STALL_SAMPLES:-2}"
+
+# Set to "false" to detect and log without reloading the driver.
+AP_RADIO_ENFORCE="${AP_RADIO_ENFORCE:-true}"
+
+# Reloading the Wi-Fi driver drops AP clients, so it is rate limited. A
+# CONFIRMED stall means clients are already getting nothing, so the reload is
+# close to free -- this interval exists only to stop a misdetection from
+# looping, not to protect working clients.
+WD_AP_RELOAD_LAST=0
+WD_AP_RELOAD_MIN_INTERVAL="${WD_AP_RELOAD_MIN_INTERVAL:-600}"
+WD_AP_TXQ_STALL_STREAK=0
+WD_AP_LAST_TX_PACKETS=-1
+WD_AP_STALL_REASON=""
+
+# --- DNS leak detection state --------------------------------------------
+# Last value read from the dns_leak_uplink nftables counter. Growth between
+# loops means something on this Pi sent a plaintext DNS query out the uplink.
+# -1 means "not sampled yet", so the first loop establishes a baseline instead
+# of reporting every query since boot as a fresh leak.
+WD_DNS_LEAK_BYTES=-1
+WD_DNS_LEAK_REPORTED=false
+WD_DNS_COUNTER_RELOADED=false
 
 # --- Egress verification state -------------------------------------------
 # Shared, reboot-scoped proof written by tunnel-exit-up.sh and this watchdog.
@@ -2928,6 +3159,304 @@ wd_repair_client_path() {
             fi
             ;;
     esac
+}
+
+# =========================================================================
+# DNS LEAK DETECTION
+# =========================================================================
+# tunnel.sh checks for DNS leaks exactly once, at the end of a full run. Nothing
+# re-checked afterwards, so any drift after setup went unnoticed indefinitely --
+# and the single most likely cause of drift is tunnel.sh ITSELF aborting inside
+# its own "public DNS for apt" window, which leaves resolv.conf pinned to public
+# servers and immutable. That is a leak that no later step repairs and that the
+# operator has no reason to suspect.
+#
+# Every check here is config state the kernel or a package update can change
+# under us, plus one behavioural check (the nftables counter) that catches a
+# live leak whatever the cause.
+#
+# Prints a space-separated list of problems, empty when DNS is contained.
+# \$1 is "verified" when egress is currently proven, "unverified" otherwise --
+# the counter check is only meaningful in the former case.
+wd_dns_leak_problems() {
+    local egress_state="\$1"
+    local problems=""
+    local ns_lines
+
+    # 1. resolv.conf must name the Tailscale resolver and NOTHING else. A second
+    #    nameserver is a silent fallback: the resolver library moves on to it the
+    #    moment MagicDNS is slow, so the leak appears under load rather than at
+    #    a clean "DNS is broken" moment anyone would notice.
+    ns_lines=\$(grep -E '^[[:space:]]*nameserver' /etc/resolv.conf 2>/dev/null | awk '{print \$2}')
+    if [ -z "\$ns_lines" ]; then
+        problems="\$problems resolv-conf-empty"
+    elif [ "\$ns_lines" != "\$TAILSCALE_DNS" ]; then
+        problems="\$problems resolv-conf-not-tailscale-only"
+    fi
+
+    # 2. The immutable flag is what stops NetworkManager, dhcpcd and tailscaled
+    #    from rewriting the file. Without it the contents being right now says
+    #    nothing about the next DHCP renewal.
+    if ! lsattr /etc/resolv.conf 2>/dev/null | awk '{print \$1}' | grep -q 'i'; then
+        problems="\$problems resolv-conf-mutable"
+    fi
+
+    # 3. dnsmasq is what every CLIENT resolves through, so a regression here
+    #    leaks their traffic, not the Pi's. "no-resolv" is the load-bearing
+    #    line: without it "server=" becomes additive rather than exclusive and
+    #    dnsmasq merges whatever is in resolv.conf into its upstream pool.
+    if [ -f /etc/dnsmasq.conf ]; then
+        if ! grep -qE '^[[:space:]]*no-resolv[[:space:]]*\$' /etc/dnsmasq.conf; then
+            problems="\$problems dnsmasq-no-resolv-missing"
+        fi
+        if grep -qE '^[[:space:]]*server=' /etc/dnsmasq.conf \
+            && grep -E '^[[:space:]]*server=' /etc/dnsmasq.conf \
+                | grep -qvE "^[[:space:]]*server=\${TAILSCALE_DNS}[[:space:]]*\$"; then
+            problems="\$problems dnsmasq-foreign-upstream"
+        fi
+    fi
+
+    # 4. systemd-resolved is disabled during setup, but a package update can
+    #    re-enable it. It then binds 127.0.0.53 and forwards to the DHCP
+    #    nameservers, which is a leak wearing a loopback address.
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        problems="\$problems systemd-resolved-active"
+    fi
+
+    # 5. The behavioural check, computed by the caller and passed in as \$2.
+    #    It has to be sampled in the main loop rather than here: this function
+    #    is called in a \$( ) command substitution, so it runs in a subshell and
+    #    any baseline it stored would be thrown away -- the comparison would
+    #    silently never fire.
+    if [ -n "\$2" ]; then
+        problems="\$problems \$2"
+    fi
+
+    echo "\$problems"
+}
+
+# Sample the dns_leak_uplink counter and classify the result against the
+# previous sample. Sets WD_DNS_LEAK_VERDICT (empty when all is well) and
+# updates the WD_DNS_LEAK_BYTES baseline. Must run in the main loop, not inside
+# a command substitution -- see the note in wd_dns_leak_problems.
+#
+# Growth only counts as a leak while egress is verified: with no tunnel,
+# tailscaled's bootstrap DNS legitimately goes out the uplink, which is the
+# whole reason this is a counter and not a drop rule.
+wd_sample_dns_leak_counter() {
+    local egress_state="\$1"
+    local leak_bytes
+    WD_DNS_LEAK_VERDICT=""
+
+    # Plain-text output, not "nft -j": JSON support varies by nft build, and a
+    # parse that silently yields nothing would be read as "counter missing" and
+    # trigger an nftables reload every 30 seconds -- each one briefly flushing
+    # the whole ruleset. The text form ("packets N bytes M") is stable.
+    leak_bytes=\$(nft list counter inet filter dns_leak_uplink 2>/dev/null \
+        | grep -oE 'bytes[[:space:]]+[0-9]+' | awk '{print \$2}' | head -1)
+
+    case "\$leak_bytes" in
+        ''|*[!0-9]*)
+            # Counter absent: the ruleset predates this check or was flushed.
+            WD_DNS_LEAK_VERDICT="dns-leak-counter-missing"
+            WD_DNS_LEAK_BYTES=-1
+            ;;
+        *)
+            if [ "\$egress_state" = "verified" ] \
+                && [ "\$WD_DNS_LEAK_BYTES" -ge 0 ] \
+                && [ "\$leak_bytes" -gt "\$WD_DNS_LEAK_BYTES" ]; then
+                WD_DNS_LEAK_VERDICT="dns-leaving-uplink-in-plaintext"
+            fi
+            WD_DNS_LEAK_BYTES=\$leak_bytes
+            ;;
+    esac
+}
+
+# Repairs for everything wd_dns_leak_problems can detect. All in-place and
+# non-disruptive: no client is dropped and the tunnel is not reset.
+wd_repair_dns_leak() {
+    local problems=" \$1 "
+
+    case "\$problems" in
+        *" resolv-conf-empty "*|*" resolv-conf-not-tailscale-only "*|*" resolv-conf-mutable "*)
+            chattr -i /etc/resolv.conf 2>/dev/null || true
+            rm -f /etc/resolv.conf 2>/dev/null || true
+            if printf 'nameserver %s\n' "\$TAILSCALE_DNS" > /etc/resolv.conf 2>/dev/null; then
+                chattr +i /etc/resolv.conf 2>/dev/null || true
+                wd_log "[Watchdog] resolv.conf re-pinned to \$TAILSCALE_DNS (immutable)"
+            else
+                wd_log "[Watchdog] FAILED to rewrite /etc/resolv.conf - still leaking"
+            fi
+            ;;
+    esac
+
+    case "\$problems" in
+        *" systemd-resolved-active "*)
+            systemctl stop systemd-resolved 2>/dev/null || true
+            systemctl disable systemd-resolved 2>/dev/null || true
+            wd_log "[Watchdog] systemd-resolved stopped and disabled"
+            ;;
+    esac
+
+    # Surgical, not a regeneration: the watchdog cannot rebuild dnsmasq.conf
+    # (tunnel.sh assembles it from the AP and ethernet settings together), but it
+    # can restore the two lines that contain the leak and reload. Clients keep
+    # their leases across a dnsmasq restart, so this costs nothing visible.
+    case "\$problems" in
+        *" dnsmasq-no-resolv-missing "*|*" dnsmasq-foreign-upstream "*)
+            if [ -f /etc/dnsmasq.conf ]; then
+                sed -i -E '/^[[:space:]]*server=/d' /etc/dnsmasq.conf 2>/dev/null || true
+                grep -qE '^[[:space:]]*no-resolv[[:space:]]*\$' /etc/dnsmasq.conf 2>/dev/null \
+                    || printf 'no-resolv\n' >> /etc/dnsmasq.conf 2>/dev/null || true
+                printf 'server=%s\n' "\$TAILSCALE_DNS" >> /etc/dnsmasq.conf 2>/dev/null || true
+                systemctl restart dnsmasq 2>/dev/null || true
+                wd_log "[Watchdog] dnsmasq upstream restored to \$TAILSCALE_DNS only (no-resolv enforced)"
+            fi
+            ;;
+    esac
+
+    # Reload at most once per watchdog lifetime. An nftables reload flushes the
+    # entire ruleset for an instant, so repeating it every 30s would be far
+    # worse than the missing counter it is trying to restore -- and if the
+    # running nftables simply cannot provide the counter, retrying never helps.
+    case "\$problems" in
+        *" dns-leak-counter-missing "*)
+            if [ "\$WD_DNS_COUNTER_RELOADED" = false ] && [ -f /etc/nftables.conf ]; then
+                WD_DNS_COUNTER_RELOADED=true
+                nft -f /etc/nftables.conf 2>/dev/null || true
+                wd_log "[Watchdog] Reloaded nftables to restore the dns_leak_uplink counter"
+            fi
+            ;;
+    esac
+
+    # No automatic repair for a live leak that the config checks did not also
+    # flag: the config is correct and something is resolving out the uplink
+    # anyway (a hardcoded resolver in an app, a container, a DoH client falling
+    # back to port 53). Report it with enough detail to chase, and leave it --
+    # guessing at a fix here would be worse than saying so plainly.
+    case "\$problems" in
+        *" dns-leaving-uplink-in-plaintext "*)
+            wd_log "[Watchdog] DNS LEAK: plaintext port 53 left \$HOTEL_WIFI while the tunnel was up."
+            wd_log "[Watchdog]   resolv.conf and dnsmasq config check out, so this is a process"
+            wd_log "[Watchdog]   with its own resolver. Identify it with:"
+            wd_log "[Watchdog]     sudo tcpdump -ni \$HOTEL_WIFI port 53"
+            ;;
+    esac
+}
+
+# =========================================================================
+# AP RADIO HEALTH -- mt7921u firmware TX stall
+# =========================================================================
+# See the AP radio health state block above for the full diagnosis, the
+# healthy/stalled TXQ numbers this is based on, and the two signals that were
+# tried first and proven to be false positives.
+#
+# The stall is confirmed only when BOTH hold across consecutive samples:
+#   1. the multicast TXQ has a backlog (qsz-pkt > 0), and
+#   2. tx_packets has not advanced at all
+# Either alone is ambiguous -- a backlog with tx_packets climbing is just
+# congestion, and a frozen counter with an empty queue is simply an idle AP.
+# Together, with nothing draining for AP_TXQ_STALL_SAMPLES * 30s, the transmit
+# path is wedged.
+
+# Current depth of the AP's multicast TX queue, or empty if unreadable.
+wd_ap_txq_backlog() {
+    iw dev "\$AP_WIFI" info 2>/dev/null \
+        | awk '/multicast TXQ/{f=1;next} f&&/qsz-byt/{h=1;next} h{print \$2; exit}'
+}
+
+# Returns 0 and prints a reason when the AP transmit path is confirmed wedged.
+wd_ap_tx_stalled() {
+    local qsz txp
+
+    # Only meaningful while the AP is supposed to be serving. When the tunnel is
+    # unverified hostapd is deliberately stopped (fail closed) and a silent
+    # radio is correct, not a fault.
+    if ! systemctl is-active --quiet hostapd 2>/dev/null; then
+        WD_AP_TXQ_STALL_STREAK=0
+        WD_AP_LAST_TX_PACKETS=-1
+        return 1
+    fi
+
+    qsz=\$(wd_ap_txq_backlog)
+    txp=\$(cat "/sys/class/net/\$AP_WIFI/statistics/tx_packets" 2>/dev/null)
+
+    case "\$qsz\$txp" in
+        ''|*[!0-9]*)
+            # Unreadable (interface gone mid-reload, or an iw output change).
+            # Reset rather than guess -- never escalate on missing data.
+            WD_AP_TXQ_STALL_STREAK=0
+            WD_AP_LAST_TX_PACKETS=-1
+            return 1
+            ;;
+    esac
+
+    if [ "\$qsz" -gt 0 ] && [ "\$WD_AP_LAST_TX_PACKETS" -ge 0 ] \
+        && [ "\$txp" -eq "\$WD_AP_LAST_TX_PACKETS" ]; then
+        WD_AP_TXQ_STALL_STREAK=\$(( WD_AP_TXQ_STALL_STREAK + 1 ))
+    else
+        WD_AP_TXQ_STALL_STREAK=0
+    fi
+    WD_AP_LAST_TX_PACKETS=\$txp
+
+    if [ "\$WD_AP_TXQ_STALL_STREAK" -ge "\$AP_TXQ_STALL_SAMPLES" ]; then
+        # Sets a global rather than echoing: the caller must invoke this
+        # function DIRECTLY, never in \$( ), or the streak counter above is
+        # mutated in a subshell and thrown away.
+        WD_AP_STALL_REASON="txq-backlog-\${qsz}-packets-tx-frozen-at-\$txp"
+        return 0
+    fi
+    WD_AP_STALL_REASON=""
+    return 1
+}
+
+# Reinitialize the adapter firmware. This is the hand-verified repair: on this
+# Pi "modprobe -r mt7921u && modprobe mt7921u" took the queue from 66 packets
+# back to 0 and the SSID returned immediately. A hostapd restart does NOT work,
+# because it never reloads firmware -- before this, only a reboot cleared it.
+wd_repair_ap_tx_stall() {
+    local drv now qsz
+
+    if [ "\$AP_RADIO_ENFORCE" != "true" ]; then
+        return 0
+    fi
+
+    now=\$(date +%s)
+    if [ "\$WD_AP_RELOAD_LAST" -gt 0 ] \
+        && [ \$(( now - WD_AP_RELOAD_LAST )) -lt "\$WD_AP_RELOAD_MIN_INTERVAL" ]; then
+        wd_log "[Watchdog] AP TX still stalled but driver was reloaded <\${WD_AP_RELOAD_MIN_INTERVAL}s ago - waiting"
+        return 0
+    fi
+
+    # Derive the module name rather than hardcoding mt7921u, so this survives
+    # swapping the USB adapter.
+    drv=\$(basename "\$(readlink -f "/sys/class/net/\$AP_WIFI/device/driver" 2>/dev/null)" 2>/dev/null)
+    if [ -z "\$drv" ] || [ "\$drv" = "." ] || [ "\$drv" = "/" ]; then
+        wd_log "[Watchdog] AP TX stalled but the driver module could not be identified - manual action needed (a reboot clears it)"
+        return 0
+    fi
+
+    WD_AP_RELOAD_LAST=\$now
+    wd_log "[Watchdog] AP TX path stalled - reloading \$drv firmware (clients will reconnect)"
+    systemctl stop hostapd 2>/dev/null || true
+    modprobe -r "\$drv" 2>/dev/null || true
+    sleep 3
+    modprobe "\$drv" 2>/dev/null || true
+    sleep 5
+    systemctl start hostapd 2>/dev/null || true
+    sleep 5
+
+    # Reloading the module resets every counter, so re-baseline rather than
+    # comparing against pre-reload values.
+    WD_AP_TXQ_STALL_STREAK=0
+    WD_AP_LAST_TX_PACKETS=-1
+
+    qsz=\$(wd_ap_txq_backlog)
+    if [ "\$qsz" = "0" ]; then
+        wd_log "[Watchdog] AP TX path recovered after reloading \$drv"
+    else
+        wd_log "[Watchdog] AP TX queue still at '\$qsz' after reloading \$drv - a reboot is known to clear this"
+    fi
 }
 
 # Use the same lock file as tunnel-exit-up.sh when publishing watchdog proof.
@@ -3372,7 +3901,23 @@ while true; do
             || systemctl is-active --quiet dnsmasq 2>/dev/null; then
             wd_log "[Watchdog] No verified egress in the last \${WD_VERIFY_MAX_AGE}s - stopping AP (fail closed)"
             systemctl stop hostapd 2>/dev/null || true
-            systemctl stop dnsmasq 2>/dev/null || true
+            # dnsmasq is the DHCP server for BOTH subnets, so stopping it also
+            # kills the wired rescue path: a laptop on the cable loses its lease,
+            # self-assigns 169.254.x.x and can no longer reach \$ETH_GATEWAY --
+            # exactly when the cable is the only way back in. Keep it running
+            # when ETH_ENABLE is active.
+            #
+            # Nothing leaks by keeping it up. Stopping hostapd above already
+            # removes the SSID, so no Wi-Fi client can associate to ask for a
+            # lease at all; the nftables forward chain still drops client traffic
+            # with no tunnel behind it; and dnsmasq's only upstream is
+            # 100.100.100.100, which resolves nothing without tailscale0. A
+            # wired client gets an address and DNS that both fail closed.
+            if [ "\$ETH_ENABLED" = "true" ]; then
+                wd_log "[Watchdog] Keeping dnsmasq up for the wired rescue path on \$ETH_INTERFACE"
+            else
+                systemctl stop dnsmasq 2>/dev/null || true
+            fi
         fi
         if [ "\$ETH_ENABLED" = "true" ]; then
             # Deliberately do NOT take the wired link down here. Stopping dnsmasq
@@ -3406,6 +3951,63 @@ while true; do
             wd_log "[Watchdog] Ethernet interface \$ETH_INTERFACE lost \$ETH_GATEWAY - re-applying..."
             ip addr replace "\$ETH_GATEWAY/24" dev "\$ETH_INTERFACE" 2>/dev/null || true
         fi
+    fi
+
+    # ==========================================================================
+    # DNS LEAK MONITORING
+    # ==========================================================================
+    # Deliberately NOT gated on verified egress, unlike the client-path probe.
+    # A broken tunnel is when a leak is most likely and most harmful: it is the
+    # state tunnel.sh aborts in, the state that leaves resolv.conf pinned to
+    # public DNS, and the state in which a client that still has a lease will
+    # happily resolve through whatever answers. Checking only while healthy
+    # would skip every case worth catching.
+    if [ \$(( \$(date +%s) - WD_LAST_VERIFIED )) -lt "\$WD_VERIFY_MAX_AGE" ]; then
+        WD_EGRESS_STATE=verified
+    else
+        WD_EGRESS_STATE=unverified
+    fi
+    wd_sample_dns_leak_counter "\$WD_EGRESS_STATE"
+    WD_DNS_PROBLEMS=\$(wd_dns_leak_problems "\$WD_EGRESS_STATE" "\$WD_DNS_LEAK_VERDICT")
+    if [ -n "\$WD_DNS_PROBLEMS" ]; then
+        wd_log "[Watchdog] DNS containment broken:\$WD_DNS_PROBLEMS - repairing in place..."
+        wd_repair_dns_leak "\$WD_DNS_PROBLEMS"
+        # Re-check config state only. The counter is NOT re-sampled: a leak that
+        # already happened cannot be un-happened, so sampling again would report
+        # the same growth forever. The next loop judges it afresh against the
+        # baseline this one stored.
+        WD_DNS_PROBLEMS=\$(wd_dns_leak_problems "\$WD_EGRESS_STATE" "")
+        if [ -n "\$WD_DNS_PROBLEMS" ]; then
+            # Rate-limit: without this a leak the watchdog cannot fix (a process
+            # with its own resolver) writes two lines to the SD card every 30
+            # seconds forever.
+            if [ "\$WD_DNS_LEAK_REPORTED" = false ]; then
+                wd_log "[Watchdog] DNS still not contained after repair:\$WD_DNS_PROBLEMS"
+                WD_DNS_LEAK_REPORTED=true
+            fi
+        else
+            wd_log "[Watchdog] DNS containment restored"
+            WD_DNS_LEAK_REPORTED=false
+        fi
+    else
+        WD_DNS_LEAK_REPORTED=false
+    fi
+
+    # ==========================================================================
+    # AP RADIO MONITORING
+    # ==========================================================================
+    # Self-gating: wd_ap_tx_stalled returns false whenever hostapd is not
+    # running, so it never fights the fail-closed logic that deliberately stops
+    # the AP. Otherwise unconditional -- a wedged transmit path must be caught
+    # whatever the tunnel is doing.
+    #
+    # IMPORTANT: wd_ap_tx_stalled mutates streak state, so it must be called
+    # directly and NOT inside $( ), which would run it in a subshell and discard
+    # the streak -- the exact bug that silently disabled the DNS leak counter
+    # before it was caught.
+    if wd_ap_tx_stalled; then
+        wd_log "[Watchdog] AP transmit path stalled (\$WD_AP_STALL_REASON)"
+        wd_repair_ap_tx_stall
     fi
 done
 SCRIPTEOF
@@ -3459,13 +4061,26 @@ if [ ! -f /etc/systemd/system/tunnel-watchdog.service ]; then
     exit 1
 fi
 
-# --- Persistent logs for the two units that matter, WITHOUT persistent journald ---
-# journald here runs volatile (logs in /run, wiped every reboot), which is why a
-# power cut leaves nothing to diagnose. Making the whole journal persistent would
-# work but writes far more to the SD card than these two units justify -- dnsmasq
-# alone would dominate it. Send just these units to a file instead: the watchdog
-# only prints when it takes action, so a healthy day writes essentially nothing,
-# and logrotate below bounds it regardless.
+# --- Persistent logs for the two units that matter --------------------------
+# CORRECTION: an earlier version of this comment asserted "journald here runs
+# volatile (logs in /run, wiped every reboot)". That was ASSUMED, never checked,
+# and on this Pi it is false -- /var/log/journal exists, so journald is
+# persistent and every unit's output lands on the SD card. The whole "it's free
+# because it's in RAM" argument that justified log-dhcp and tolerated chatty
+# units was therefore wrong. Verify, don't assume:
+#     ls -d /var/log/journal    # exists => persistent => writes hit the card
+#
+# Persistent journald is kept deliberately, NOT switched to volatile. It is what
+# made an AP radio failure diagnosable hours after the fact, across the exact
+# window a volatile journal would have been fine for but a reboot would have
+# erased. The fix for write volume is to stop the things that spam, not to throw
+# away the record. See the journald bounds and tailscaled knobs below.
+#
+# These two units still get their own file: one timestamped place to read the
+# tunnel's own history, and the watchdog only prints when it takes action, so a
+# healthy day writes essentially nothing. logrotate below bounds it regardless.
+# Note StandardOutput=append: REPLACES journal output for these units, so this
+# is not a double write.
 echo "=== Configuring persistent logging for tunnel units ==="
 for unit in tunnel-watchdog tailscale-exit; do
     sudo mkdir -p "/etc/systemd/system/${unit}.service.d"
@@ -3493,6 +4108,80 @@ sudo tee /etc/logrotate.d/tunnel > /dev/null <<'ROTEOF'
 }
 ROTEOF
 echo "   ✅ tunnel-watchdog and tailscale-exit now log to /var/log/tunnel.log"
+
+# --- Bound what the persistent journal costs the SD card --------------------
+# With journald persistent (see the correction above), an unbounded journal on a
+# Pi defaults to up to 10% of /var -- gigabytes of flash writes and rewrites for
+# logs nobody will read. Cap it instead. Compression is on by default but is
+# stated explicitly because it is the single biggest reduction in bytes written.
+#
+# Rate limiting is left GENEROUS on purpose. Tightening it is tempting for wear,
+# but a dropped message during an incident is exactly how a failure becomes
+# undiagnosable -- which already happened on this box. Bound the total, keep the
+# detail.
+echo "=== Bounding persistent journal size (SD card wear) ==="
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/tunnel-sd-wear.conf > /dev/null <<'JRNEOF'
+# Managed by tunnel.sh -- limits SD card wear from the persistent journal.
+[Journal]
+Storage=persistent
+Compress=yes
+SystemMaxUse=64M
+SystemMaxFileSize=8M
+SystemMaxFiles=8
+# Deliberately generous: cap runaway, never lose an incident.
+RateLimitIntervalSec=30s
+RateLimitBurst=2000
+JRNEOF
+echo "   ✅ Journal capped at 64M (compressed) in /etc/systemd/journald.conf.d/tunnel-sd-wear.conf"
+
+# --- Stop tailscaled's portmapper from spamming the journal ------------------
+# Measured on this Pi: a continuous stream, every few seconds, all day, forever:
+#   portmapper: saw UPnP type WANIPConnection1 at http://<router>:49652/...
+#   open-conn-track: flow TCP <self>:NNNNN > <router>:49652 rejected due to acl
+#
+# tailscaled's portmapper keeps discovering UPnP on the local router and trying
+# to open a port mapping; --exit-node-allow-lan-access=false then rejects every
+# attempt. It can never succeed, and it retries indefinitely. With a persistent
+# journal that is a permanent write load on the card, and it drowns the log --
+# the 20-minute window around a real AP failure was ~95% these lines.
+#
+# Nothing here needs inbound reachability: this node originates traffic through
+# an exit node and advertises nothing, so port mapping has no purpose. Disable
+# the whole portmapper (UPnP, NAT-PMP and PCP). TS_DISABLE_UPNP would cover only
+# the UPnP half seen above; the broader knob avoids the same noise reappearing
+# via NAT-PMP on a different router.
+#
+# These are envknob.RegisterBool knobs read by tailscaled itself, so a systemd
+# drop-in works -- this is not Docker-only. A drop-in rather than editing
+# /etc/default/tailscaled so a Tailscale package upgrade cannot clobber it.
+echo "=== Disabling tailscaled portmapper (no inbound needed via exit node) ==="
+sudo mkdir -p /etc/systemd/system/tailscaled.service.d
+sudo tee /etc/systemd/system/tailscaled.service.d/no-portmapper.conf > /dev/null <<'PMEOF'
+# Managed by tunnel.sh -- this node reaches the internet through an exit node and
+# never accepts inbound connections, so UPnP/NAT-PMP/PCP probing is pure noise.
+[Service]
+Environment=TS_DISABLE_PORTMAPPER=1
+Environment=TS_DISABLE_UPNP=1
+PMEOF
+echo "   ✅ Portmapper disabled via /etc/systemd/system/tailscaled.service.d/no-portmapper.conf"
+
+sudo systemctl daemon-reload
+sudo systemctl restart systemd-journald 2>/dev/null || true
+sudo systemctl restart tailscaled 2>/dev/null || true
+
+# Verify the spam actually stopped rather than assuming it did.
+echo "   Checking that portmapper chatter has stopped (30s sample)..."
+sleep 30
+PORTMAP_LINES=$(sudo journalctl -u tailscaled --since "30 seconds ago" --no-pager 2>/dev/null \
+    | grep -ciE 'portmapper|rejected due to acl' || true)
+if [ "${PORTMAP_LINES:-0}" -eq 0 ]; then
+    echo "   ✅ No portmapper lines in the last 30s"
+else
+    echo "   ⚠️  Still seeing $PORTMAP_LINES portmapper/acl lines in 30s"
+    echo "      The env knob may not be honored by this tailscaled build."
+    echo "      Check: systemctl show tailscaled -p Environment"
+fi
 
 sudo systemctl daemon-reload
 sudo systemctl enable tunnel-watchdog

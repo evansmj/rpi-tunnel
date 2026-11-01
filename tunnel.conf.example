@@ -37,14 +37,40 @@ AP_CHANNEL="6"
 
 # WiFi hardware mode (frequency band)
 # Options:
-#   g (2.4GHz - most compatible)
-#   a or ac (5GHz - for adapters like the Netgear A8000; both are equivalent)
-#   n (same as g)
-# 802.11n is always enabled on top of the base mode, and 5GHz modes also get
-# 802.11ac/ax with an 80 MHz channel when the chosen AP_CHANNEL allows it
-# (36-48 and 149-161 do; 165 is 20 MHz only).
+#   g (2.4GHz 802.11g - most compatible)
+#   a (5GHz - use this for WiFi 6 adapters like the Netgear A8000)
+#   n (2.4GHz 802.11n)
+#   ac (5GHz 802.11ac)
 # Note: Your USB WiFi adapter must support the selected mode
+# For WiFi 6 (802.11ax) adapters, use "a" mode with 5GHz channels.
+#
+# On 5GHz, 802.11n/ac/ax are all enabled on top of the band, with an 80 MHz
+# channel when AP_CHANNEL allows it (36-48 and 149-161 do; 165 is 20 MHz only).
+# Use AP_ENABLE_AC / AP_ENABLE_AX below to narrow that deliberately.
 AP_HW_MODE="g"
+
+# Step the 5GHz PHY down (both default to "true" = fastest, and that default is
+# the long-standing behavior -- leave them alone unless you are debugging).
+#
+# Why these exist: mt7921-based USB adapters (e.g. Netgear A8000) can wedge
+# their transmit queue in AP mode. The SSID stays visible, hostapd reports
+# state=ENABLED, clients associate and their packets reach the Pi -- but nothing
+# the Pi sends ever reaches them, so clients are dropped as "inactive" one by
+# one. Only reloading the driver or rebooting clears it. The watchdog detects
+# and repairs this automatically; these toggles let you bisect whether a
+# narrower PHY avoids it in the first place:
+#
+#   both true (default)      ac + ax, 80 MHz    fastest
+#   AP_ENABLE_AX="false"     ac only, 80 MHz    drops the least-exercised path
+#   AP_ENABLE_AC="false"     802.11n, <=40 MHz  most conservative
+#
+# Stepping down usually costs nothing you can measure: on a tunnelled AP the
+# exit node sets the ceiling, not the radio. Check yours before deciding --
+# compare "iw dev <ap> station dump" (PHY rate) against an actual speed test.
+# Measured on one setup: ~79 Mbps through the tunnel vs 780-1200 Mbit/s PHY, so
+# even the most conservative rung had ~2x headroom.
+AP_ENABLE_AC="true"
+AP_ENABLE_AX="true"
 
 # Regulatory country code for WiFi channels
 # Set this to your country code (e.g., US, GB, CA, AU) to enable proper 5GHz channels
